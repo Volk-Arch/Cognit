@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# Copyright (c) 2026 Igor Kriusov <kriusovia@gmail.com>
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 """
-Echo PoC — Persistent Neural Context (RWKV)
+Cognit — Persistent Neural Context (RWKV)
 ============================================
 RWKV — рекуррентная архитектура без ограничения на размер контекста.
 Текст любой длины прогоняется чанками; состояние накапливается итеративно.
@@ -466,7 +468,7 @@ def _handoff_to_transformer():
 def cli_loop():
     print("""
 ╔══════════════════════════════════════════════╗
-║  🧠 ECHO — Persistent Neural Context         ║
+║  🧠 Cognit — Persistent Neural Context      ║
 ║  RWKV · Рекуррентное состояние · ∞ контекст  ║
 ╚══════════════════════════════════════════════╝""")
 

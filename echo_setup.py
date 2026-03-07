@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# Copyright (c) 2026 Igor Kriusov <kriusovia@gmail.com>
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 """
-echo_setup.py — одноразовая настройка Echo для проекта
+echo_setup.py — одноразовая настройка Cognit для проекта
 ========================================================
 Запуск:
     python echo_setup.py
@@ -59,7 +61,7 @@ def _ask_yn(prompt: str, default: bool = True) -> bool:
 def _ask_client_project() -> Path | None:
     """Спрашивает путь к основному (клиентскому) проекту."""
     print("\n── Основной проект (для git-хука) ──────────────────────")
-    print("   Echo живёт в своём репо. Укажи путь к проекту,")
+    print("   Cognit живёт в своём репо. Укажи путь к проекту,")
     print("   который хочешь анализировать — хук поставится туда.")
 
     # Подставляем сохранённый путь как дефолт
@@ -138,7 +140,7 @@ def setup_gitignore():
     print("\n── .gitignore ──────────────────────────────────────────")
 
     lines_to_add = [
-        "# Echo PoC — паттерны не версионируются, хранятся локально или в S3",
+        "# Cognit — паттерны не версионируются, хранятся локально или в S3",
         f"{PATTERNS_BASE}/",
     ]
 
@@ -168,7 +170,7 @@ def _make_hook_script(echo_script_path: str) -> str:
     posix_path = Path(echo_script_path).as_posix()
     return f"""\
 #!/bin/sh
-# Echo PoC — post-commit hook
+# Cognit — post-commit hook
 # echo-скрипт: {posix_path}
 
 if git rev-parse HEAD~1 >/dev/null 2>&1; then
@@ -186,7 +188,7 @@ if [ ! -f "$ECHO_SCRIPT" ]; then
     exit 0
 fi
 
-echo "[Echo] Checking patterns for changed files..."
+echo "[Cognit] Checking patterns for changed files..."
 echo "$CHANGED" | while read -r file; do
     python "$ECHO_SCRIPT" --refresh-file "$file" 2>/dev/null
 done
@@ -396,7 +398,7 @@ def main():
         if subcmd == "agents":
             print("""
 ╔══════════════════════════════════════════════╗
-║  🧠 Echo — Инициализация agents/             ║
+║  🧠 Cognit — Инициализация agents/          ║
 ╚══════════════════════════════════════════════╝""")
             # Читаем client_project из .echo.json если есть
             client = None
@@ -416,7 +418,7 @@ def main():
 
     print("""
 ╔══════════════════════════════════════════════╗
-║  🧠 Echo PoC — Настройка проекта            ║
+║  🧠 Cognit — Настройка проекта             ║
 ╚══════════════════════════════════════════════╝""")
 
     git_root = _git_root()
@@ -447,8 +449,8 @@ def main():
             json.dump(config, f, ensure_ascii=False, indent=2)
         print(f"   ✅ client_project сохранён в {ECHO_CONFIG}")
 
-    # Хук в самом Echo-репозитории (опционально)
-    if git_root and _ask_yn("\nУстановить хук и в Echo-репозитории?", default=False):
+    # Хук в самом Cognit-репозитории (опционально)
+    if git_root and _ask_yn("\nУстановить хук и в Cognit-репозитории?", default=False):
         setup_hook(git_root, echo_script)
 
     if _ask_yn("\nСоздать папку agents/ с шаблонами?", default=True):

@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# Copyright (c) 2026 Igor Kriusov <kriusovia@gmail.com>
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 """
 echo_core.py — Общие утилиты для echo_poc.py и echo_rwkv.py
 =============================================================

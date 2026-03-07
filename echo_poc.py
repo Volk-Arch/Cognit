@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# Copyright (c) 2026 Igor Kriusov <kriusovia@gmail.com>
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 """
-Echo PoC — Persistent Neural Context (Transformer)
+Cognit — Persistent Neural Context (Transformer)
 ====================================================
 Концепция: KV-cache локальной LLM = "паттерн активности" = персистентная память.
 
@@ -344,7 +346,7 @@ def _hint_patterns():
 def cli_loop(auto_route: bool = False):
     print("""
 ╔══════════════════════════════════════════════╗
-║  🧠 ECHO — Persistent Neural Context         ║
+║  🧠 Cognit — Persistent Neural Context      ║
 ║  Transformer · KV-cache                      ║
 ╚══════════════════════════════════════════════╝""")
 

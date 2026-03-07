@@ -1,4 +1,4 @@
-# Echo PoC — контекст проекта для Claude
+# Cognit — контекст проекта для Claude
 
 ## Что это
 
@@ -13,9 +13,7 @@
 | `echo_rwkv.py` | RWKV-бэкенд. Рекуррентное состояние, без лимита контекста |
 | `echo_core.py` | Общие утилиты: git-хелперы, file hash, паттерны, route save/load |
 | `echo_setup.py` | Одноразовая настройка: `.echo.json`, `.gitignore`, git-хук, `agents/` |
-| `README.md` | Документация по командам |
-| `ARTICLE.md` | Статья о концепции |
-| `DEMO.md` | Полный демо-сценарий (RWKV → route → Transformer → код-ревью) |
+| `README.md` | Полная документация: концепция, команды, сценарии, настройка |
 
 ## Архитектура
 
@@ -36,9 +34,9 @@ models/            ← GGUF-файлы (в .gitignore)
   rwkv/
 ```
 
-## Два репо: Echo + клиентский проект
+## Два репо: Cognit + клиентский проект
 
-Echo живёт в своём репо. Клиентский проект — отдельный git.
+Cognit живёт в своём репо. Клиентский проект — отдельный git.
 `echo_setup.py` спрашивает путь к клиентскому проекту → устанавливает
 post-commit хук туда с **абсолютным путём** к `echo_poc.py`.
 
@@ -51,7 +49,7 @@ post-commit хук туда с **абсолютным путём** к `echo_poc.
 }
 ```
 
-⚠️ При переносе Echo в другую папку — перезапустить `python echo_setup.py`
+⚠️ При переносе Cognit в другую папку — перезапустить `python echo_setup.py`
 (обновит абсолютный путь в хуке и `.echo.json`).
 
 ## Ключевые технические детали
@@ -87,12 +85,12 @@ route <задача>       — только echo_rwkv.py: маршрутизац
 
 ```bash
 python echo_poc.py                        # интерактивный режим
-python echo_poc.py --auto-route           # авто-загрузка из _route_last.json
-python echo_poc.py --refresh-file <path>  # headless: пересоздать паттерн
-python echo_poc.py --status               # headless: проверить актуальность
+python echo_poc.py --auto-route           # авто-загрузка из _route_last.json (после route в RWKV)
+python echo_poc.py --refresh-file <path>  # headless: пересоздать паттерн для файла
+python echo_poc.py --status               # headless: проверить актуальность паттернов
 
 python echo_setup.py          # полная настройка
-python echo_setup.py agents   # только создать agents/
+python echo_setup.py agents   # только создать agents/ в клиентском проекте
 ```
 
 ## echo_core.py — ключевые функции
@@ -116,5 +114,5 @@ load_last_route(patterns_dir) → dict | None          # None если >24ч
 
 ## Статус проекта
 
-Proof of concept. Всё работает, покрыто документацией (README, ARTICLE, DEMO).
+Proof of concept. Всё работает, покрыто документацией (README.md).
 Следующие возможные шаги: S3-синхронизация паттернов, веб-интерфейс, тесты.
