@@ -14,3 +14,8 @@ __pycache__/
 
 # Конфиг с абсолютными путями — у каждого свой
 .echo.json
+
+# IDE
+.claude/
+.idea/
+.venv/
