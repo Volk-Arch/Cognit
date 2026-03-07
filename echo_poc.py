@@ -115,7 +115,9 @@ def _context_prompt(text: str) -> str:
     return (
         "<|im_start|>system\n"
         "Ты — ассистент с предзагруженным контекстом. "
-        "Отвечай на вопросы, опираясь только на загруженный контекст. "
+        "Отвечай на вопросы, опираясь на загруженный контекст. "
+        "Если информации в контексте недостаточно, предложи пользователю команду: "
+        "expand <краткое описание задачи> — это переключит на RWKV с доступом ко всей кодовой базе. "
         "/no_think\n"
         "<|im_end|>\n"
         "<|im_start|>user\n"
@@ -287,6 +289,35 @@ def ask_pattern(name: str, question: str, grow: bool = True):
 
         print(f"💾 Паттерн обновлён: +{len(q_tokens)} токенов  ({meta['size_kb']} KB, диалогов: {meta['n_asks']})")
 
+    # Авто-детекция предложения expand от модели
+    _maybe_expand(name, question, "".join(collected))
+
+
+def _maybe_expand(pattern_name: str, question: str, response: str):
+    """
+    Проверяет, предложила ли модель expand. Если да — предлагает запустить его.
+    Ищет 'expand' в ответе; если найдено — пробует извлечь задачу из контекста.
+    """
+    import re
+    lower = response.lower()
+    if "expand" not in lower:
+        return
+
+    # Пробуем вытащить задачу из фразы вида "expand <задача>"
+    m = re.search(r'expand\s+([^\n`<]{5,150})', response, re.IGNORECASE)
+    if m:
+        suggested_task = m.group(1).strip().rstrip('.,!?`').strip()
+    else:
+        suggested_task = question  # используем исходный вопрос как задачу
+
+    try:
+        ans = input(f"\n🔄 Запустить expand? [{suggested_task[:60]}] [Y/n] ").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        return
+
+    if ans != "n":
+        _handoff_to_rwkv(pattern_name, suggested_task)
+
 
 def list_patterns():
     core.print_patterns_list(PATTERNS_DIR)
@@ -300,6 +331,7 @@ HELP = """
   use <имя>            — выбрать активный паттерн (память модели)
   <вопрос>             — спросить  (паттерн растёт)
   ? <вопрос>           — спросить без изменения паттерна
+  expand <задача>      — передать задачу в RWKV и выгрузиться
   /load <имя> @<файл>  — загрузить файл как паттерн
   /load <имя> <текст>  — загрузить текст как паттерн
   /list                — показать все паттерны
@@ -311,6 +343,7 @@ HELP = """
   use auth                       ← переключиться на него
   что делает функция login?      ← просто пишешь вопрос
   ? есть ли SQL-инъекции?        ← peek: не меняет паттерн
+  expand нужен контекст по auth  ← передать задачу в RWKV
 """
 
 
@@ -341,6 +374,27 @@ def _load_path(name: str, raw_path: str):
 
 def _hint_patterns():
     core.hint_patterns(PATTERNS_DIR)
+
+
+def _handoff_to_rwkv(active: str, task: str):
+    """Передаёт задачу в RWKV и завершает работу Transformer."""
+    meta = core.read_meta(PATTERNS_DIR, active) if active else {}
+    sources = [s["path"] for s in meta.get("source_files", [])]
+    path = core.save_expand_request(PATTERNS_DIR, task, active or "", sources)
+    print(f"\n🔄 Запрос сохранён: {path}")
+    print("   Освобождаю VRAM и запускаю RWKV...")
+    global llm
+    del llm
+    import gc
+    gc.collect()
+    try:
+        import torch
+        torch.cuda.empty_cache()
+    except ImportError:
+        pass
+    import subprocess
+    subprocess.Popen([sys.executable, "echo_rwkv.py", "--auto-expand"])
+    sys.exit(0)
 
 
 def cli_loop(auto_route: bool = False):
@@ -449,6 +503,15 @@ def cli_loop(auto_route: bool = False):
                     _hint_patterns()
                     continue
                 ask_pattern(active, question, grow=False)
+
+            # ── expand <задача> → handoff to RWKV ───────────────────────────
+            elif user_input.lower().startswith("expand ") or user_input.lower() == "expand":
+                task = user_input[7:].strip()
+                if not task:
+                    print("❌ Использование: expand <задача>")
+                    print("   Пример: expand нужен контекст по модулю авторизации")
+                    continue
+                _handoff_to_rwkv(active, task)
 
             # ── просто текст → ask ───────────────────────────────────────────
             else:
@@ -567,5 +630,6 @@ if __name__ == "__main__":
             print(f"Неизвестный флаг: {sys.argv[1]}")
             print("Флаги: --auto-route, --refresh-file <path>, --status")
             sys.exit(1)
+
     else:
         cli_loop()

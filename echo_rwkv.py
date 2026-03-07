@@ -127,7 +127,9 @@ def _context_prompt(text: str) -> str:
     """Промпт для загрузки контекста (формат RWKV-World)."""
     return (
         f"User: Прочитай и запомни этот контекст:\n\n{text.strip()}\n\n"
-        "Assistant: Контекст загружен. Готов отвечать на вопросы.\n\n"
+        "Assistant: Контекст загружен. Готов отвечать на вопросы. "
+        "Если для задачи нужна точная работа с конкретными файлами — "
+        "предложи команду route <задача>, чтобы передать управление Transformer.\n\n"
     )
 
 
@@ -295,6 +297,36 @@ def ask_pattern(name: str, question: str, grow: bool = True):
 
         print(f"💾 Паттерн обновлён  ({meta['size_kb']} KB, диалогов: {meta['n_asks']})")
 
+    # Авто-детекция предложения route от модели
+    _maybe_route(name, question, "".join(collected))
+
+
+def _maybe_route(pattern_name: str, question: str, response: str):
+    """
+    Проверяет, предложила ли модель route. Если да — предлагает запустить его прямо сейчас.
+    Ищет 'route' в ответе; если найдено — пробует извлечь задачу из контекста.
+    """
+    import re
+    lower = response.lower()
+    if "route" not in lower:
+        return
+
+    # Пробуем вытащить задачу из фразы вида "route <задача>"
+    m = re.search(r'route\s+([^\n`<]{5,150})', response, re.IGNORECASE)
+    if m:
+        suggested_task = m.group(1).strip().rstrip('.,!?`').strip()
+    else:
+        suggested_task = question  # используем исходный вопрос как задачу
+
+    try:
+        ans = input(f"\n🗺  Запустить route? [{suggested_task[:60]}] [Y/n] ").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        return
+
+    if ans != "n":
+        route_pattern(pattern_name, suggested_task)
+        _handoff_to_transformer()
+
 
 def route_pattern(index_name: str, task: str):
     """
@@ -401,6 +433,11 @@ HELP = """
   use repo
   route добавить логин    ← какие файлы нужны? (вывод → скопируй в echo_poc.py)
   что такое WorldModel?   ← обычный вопрос по индексу
+
+ПРИМЕР (получение задачи от Transformer):
+  Transformer пишет: expand нужен контекст по auth
+  RWKV запускается автоматически, показывает задачу
+  use repo → задай вопрос по задаче → route если нужны конкретные файлы
 """
 
 
@@ -465,7 +502,7 @@ def _handoff_to_transformer():
     sys.exit(0)
 
 
-def cli_loop():
+def cli_loop(auto_expand: bool = False):
     print("""
 ╔══════════════════════════════════════════════╗
 ║  🧠 Cognit — Persistent Neural Context      ║
@@ -473,7 +510,21 @@ def cli_loop():
 ╚══════════════════════════════════════════════╝""")
 
     list_patterns()
-    print("\nВыбери паттерн командой 'use <имя>' или '/help' для справки.")
+
+    # Если Transformer оставил запрос — показываем его
+    expand = core.load_expand_request(PATTERNS_DIR)
+    if expand:
+        age_min = int((datetime.now() - datetime.fromisoformat(expand["requested_at"])).total_seconds() / 60)
+        print(f"\n💡 Запрос от Transformer ({age_min} мин назад):")
+        print(f"   Задача: «{expand['task']}»")
+        if expand.get("from_pattern"):
+            print(f"   Паттерн: {expand['from_pattern']}")
+        if expand.get("from_sources"):
+            print("   Файлы из контекста:")
+            for src in expand["from_sources"]:
+                print(f"   • {src}")
+    else:
+        print("\nВыбери паттерн командой 'use <имя>' или '/help' для справки.")
 
     active = None  # текущий активный паттерн
 
@@ -571,4 +622,13 @@ def cli_loop():
 
 
 if __name__ == "__main__":
-    cli_loop()
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "--auto-expand":
+            # Запущен из echo_poc.py после expand — показываем задачу без вопросов
+            cli_loop(auto_expand=True)
+        else:
+            print(f"Неизвестный флаг: {sys.argv[1]}")
+            print("Флаги: --auto-expand")
+            sys.exit(1)
+    else:
+        cli_loop()
