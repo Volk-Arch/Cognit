@@ -1,7 +1,0 @@
-{
-  "backend": "transformer",
-  "model_name": "Qwen3-8B-Q4_K_M",
-  "patterns_dir": "echo_patterns",
-  "_note": "Все участники команды должны использовать одну модель. Паттерны несовместимы между разными моделями.",
-  "client_project": "C:\\git\\DemoAI"
-}

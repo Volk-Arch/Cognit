@@ -1,22 +1,4 @@
-## 📜 License
-
-This project is licensed under the **PolyForm Noncommercial 1.0.0**.
-
-🟢 **You can:**
-- Use for personal projects and research
-- Study the code and architecture  
-- Submit pull requests and improvements
-- Fork for non-commercial experiments
-
-🔴 **You cannot:**
-- Use in commercial products or services
-- Sell this code or derivatives
-- Include in paid SaaS without permission
-
-💼 **Need commercial use?**
-Contact me at [kriusovia@gmail.com] or via [GitHub Issues](https://github.com/Volk-Arch/Cognit/issues) to discuss licensing options.
-
-# Cognit — Persistent Neural Context
+# Echo PoC — Persistent Neural Context
 
 Локальная LLM с персистентной памятью. Модель один раз читает текст — состояние сохраняется в файл. Все последующие вопросы задаются без повторной передачи контекста.
 

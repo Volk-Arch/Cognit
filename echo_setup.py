@@ -186,7 +186,7 @@ if [ ! -f "$ECHO_SCRIPT" ]; then
     exit 0
 fi
 
-echo "🧠 Echo: проверяю паттерны для изменённых файлов..."
+echo "[Echo] Checking patterns for changed files..."
 echo "$CHANGED" | while read -r file; do
     python "$ECHO_SCRIPT" --refresh-file "$file" 2>/dev/null
 done
@@ -340,11 +340,16 @@ src/
 }
 
 
-def setup_agents():
-    """Создаёт папку agents/ с шаблонами документов для обучения AI."""
+def setup_agents(target_dir: Path | None = None):
+    """Создаёт папку agents/ в клиентском проекте (или CWD если не указан)."""
     print("\n── agents/ — знания о проекте ──────────────────────────")
 
-    agents_dir = Path("agents")
+    base = target_dir if target_dir else Path(".")
+    agents_dir = base / "agents"
+
+    if target_dir:
+        print(f"   Создаю в: {target_dir}")
+
     created = []
 
     for rel_path, content in _AGENT_TEMPLATES.items():
@@ -361,22 +366,22 @@ def setup_agents():
         print("   Все файлы уже существуют.")
         return
 
+    agents_path = agents_dir.resolve()
     print(f"""
    Структура agents/:
-     agents/style/global.md    — глобальный стиль кода
-     agents/style/commands.md  — стиль команд/CLI
-     agents/arch/overview.md   — архитектура проекта
-     agents/context/project.md — контекст и бизнес-правила
+     {agents_path}/
+       style/global.md    — глобальный стиль кода
+       style/commands.md  — стиль команд/CLI
+       arch/overview.md   — архитектура проекта
+       context/project.md — контекст и бизнес-правила
 
    Заполни шаблоны → загрузи в echo как паттерны:
-     /load style @agents/style/     ← вся папка → один паттерн
-     /load arch  @agents/arch/
-     use style
+     /load style @{agents_path}/style/
+     /load arch  @{agents_path}/arch/
 """)
 
-    # agents/ должны версионироваться — НЕ добавляем в .gitignore
-    print("   Совет: agents/ НУЖНО добавить в git (в отличие от echo_patterns/).")
-    print("   git add agents/ && git commit -m 'Add agent knowledge base'")
+    print("   Совет: agents/ нужно добавить в git клиентского проекта.")
+    print(f"   cd {base.resolve()} && git add agents/ && git commit -m 'Add agent knowledge base'")
 
 
 # =============================================================================
@@ -393,7 +398,16 @@ def main():
 ╔══════════════════════════════════════════════╗
 ║  🧠 Echo — Инициализация agents/             ║
 ╚══════════════════════════════════════════════╝""")
-            setup_agents()
+            # Читаем client_project из .echo.json если есть
+            client = None
+            if Path(ECHO_CONFIG).exists():
+                try:
+                    cp = json.loads(Path(ECHO_CONFIG).read_text(encoding="utf-8")).get("client_project", "")
+                    if cp and Path(cp).exists():
+                        client = Path(cp)
+                except Exception:
+                    pass
+            setup_agents(client)
             return
         else:
             print(f"Неизвестная команда: {subcmd}")
@@ -438,7 +452,7 @@ def main():
         setup_hook(git_root, echo_script)
 
     if _ask_yn("\nСоздать папку agents/ с шаблонами?", default=True):
-        setup_agents()
+        setup_agents(client_root)  # None если клиент не задан → создаст в CWD
 
     show_s3_instructions(config, repo_name)
 
