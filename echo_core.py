@@ -186,3 +186,53 @@ def load_last_route(patterns_dir: str) -> dict | None:
         return None
 
     return data
+
+
+# =============================================================================
+# СБОР ФАЙЛОВ ДЛЯ /load (уважает .gitignore)
+# =============================================================================
+
+# Расширения текстовых файлов которые имеет смысл читать модели
+TEXT_EXTENSIONS = {
+    # Код
+    ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".java",
+    ".c", ".cpp", ".h", ".hpp", ".cs", ".rb", ".php", ".swift",
+    ".kt", ".vue", ".svelte", ".sh", ".bash", ".ps1",
+    # Данные / конфиг
+    ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".env",
+    # Документация
+    ".md", ".txt", ".rst",
+}
+
+
+def collect_text_files(dir_path: str | Path) -> list[Path]:
+    """
+    Возвращает текстовые файлы из директории.
+
+    Если это git-репо — использует `git ls-files` (автоматически
+    уважает .gitignore и возвращает только отслеживаемые файлы).
+    Иначе — rglob с фильтром по TEXT_EXTENSIONS.
+    """
+    p = Path(dir_path).resolve()
+
+    # Пробуем git ls-files
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(p), "ls-files", "--cached", "."],
+            capture_output=True, text=True, check=True
+        )
+        files = []
+        for line in result.stdout.splitlines():
+            f = (p / line).resolve()
+            if f.is_file() and f.suffix.lower() in TEXT_EXTENSIONS:
+                files.append(f)
+        if files:
+            return sorted(files)
+    except Exception:
+        pass
+
+    # Fallback: rglob без git
+    return sorted(
+        f for f in p.rglob("*")
+        if f.is_file() and f.suffix.lower() in TEXT_EXTENSIONS
+    )

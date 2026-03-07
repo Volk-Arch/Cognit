@@ -155,6 +155,7 @@ def save_pattern(name: str, text: str, source_files: list[str] = None):
     llm.reset()
     for start in range(0, total, CHUNK_SIZE):
         chunk = tokens[start : start + CHUNK_SIZE]
+        llm.n_tokens = 0  # сбрасываем позицию буфера, RWKV-состояние сохраняется
         llm.eval(chunk)
         done = min(start + CHUNK_SIZE, total)
         pct  = done * 100 // total
@@ -405,19 +406,23 @@ def _load_path(name: str, raw_path: str):
     """Загружает файл или директорию как паттерн."""
     p = Path(raw_path)
     if p.is_dir():
-        files = sorted(p.rglob("*.md")) + sorted(p.rglob("*.txt"))
-        files = [f for f in files if f.is_file()]
+        files = core.collect_text_files(p)
         if not files:
-            print(f"❌ Папка пуста или не содержит .md/.txt файлов: {raw_path}")
+            print(f"❌ Папка пуста или нет подходящих файлов: {raw_path}")
             return
         texts, paths = [], []
+        header = f"# Проект: {p.name}\nПуть: {p.resolve()}\nФайлов: {len(files)}\n"
+        texts.append(header)
         for f in files:
-            texts.append(f"# {f.relative_to(p)}\n\n{f.read_text(encoding='utf-8')}")
-            paths.append(str(f))
-        print(f"   Загружаю {len(files)} файлов из {raw_path}/")
+            try:
+                texts.append(f"# {f.relative_to(p)}\n\n{f.read_text(encoding='utf-8', errors='ignore')}")
+                paths.append(str(f))
+            except Exception:
+                pass
+        print(f"   Загружаю {len(files)} файлов из {raw_path}/  (git ls-files / rglob)")
         save_pattern(name, "\n\n---\n\n".join(texts), source_files=paths)
     elif p.is_file():
-        save_pattern(name, p.read_text(encoding="utf-8"), source_files=[str(p)])
+        save_pattern(name, p.read_text(encoding="utf-8", errors="ignore"), source_files=[str(p)])
     else:
         print(f"❌ Не найден файл или папка: {raw_path}")
 
