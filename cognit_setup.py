@@ -3,10 +3,10 @@
 # Copyright (c) 2026 Igor Kriusov <kriusovia@gmail.com>
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 """
-echo_setup.py — одноразовая настройка Cognit для проекта
+cognit_setup.py — одноразовая настройка Cognit для проекта
 ========================================================
 Запуск:
-    python echo_setup.py
+    python cognit_setup.py
 
 Что делает:
     1. Создаёт .echo.json  — фиксирует модель и бэкенд для команды
@@ -350,13 +350,13 @@ src/
 
 ## Два бэкенда
 
-### Transformer — echo_poc.py (текущий, если этот файл загружен через него)
+### Transformer — cognit_transformer.py (текущий, если этот файл загружен через него)
 - Хранит контекст в KV-cache
 - Лимит: 8192 токенов
 - Сильная сторона: точный анализ конкретного кода, детальные вопросы по загруженным файлам
 - Слабая сторона: не видит файлы, которые не были загружены явно
 
-### RWKV — echo_rwkv.py
+### RWKV — cognit_rwkv.py
 - Хранит контекст в рекуррентном состоянии фиксированного размера (~98 KB)
 - Лимит: отсутствует — читает любой объём текста
 - Сильная сторона: весь проект целиком, навигация по кодовой базе, маршрутизация
@@ -455,7 +455,7 @@ def setup_agents(target_dir: Path | None = None):
 def main():
     import sys
 
-    # Субкоманды: python echo_setup.py agents
+    # Субкоманды: python cognit_setup.py agents
     if len(sys.argv) > 1:
         subcmd = sys.argv[1].lower()
         if subcmd == "agents":
@@ -476,7 +476,7 @@ def main():
             return
         else:
             print(f"Неизвестная команда: {subcmd}")
-            print("Использование: python echo_setup.py [agents]")
+            print("Использование: python cognit_setup.py [agents]")
             sys.exit(1)
 
     print("""
@@ -498,7 +498,7 @@ def main():
     # Абсолютный путь к echo-скрипту (для прописывания в хук)
     echo_dir = Path(__file__).parent.resolve()
     backend = config.get("backend", "transformer")
-    script_name = "echo_rwkv.py" if backend == "rwkv" else "echo_poc.py"
+    script_name = "cognit_rwkv.py" if backend == "rwkv" else "cognit_transformer.py"
     echo_script = echo_dir / script_name
 
     # Хук в основном (клиентском) проекте

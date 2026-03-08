@@ -19,13 +19,22 @@ RWKV — рекуррентная архитектура без ограниче
 
     Источник: https://huggingface.co/BlinkDL/rwkv-6-world
 
+Запуск:
+    python cognit.py --rwkv            # через оркестратор (рекомендую)
+    python cognit_rwkv.py              # напрямую
+    python cognit_rwkv.py --auto-expand  # принять pending задачу от Transformer
+
 Команды:
-    context <имя> <текст>    — обработать текст → сохранить паттерн (без лимита!)
-    context <имя> @<файл>    — то же, но текст из файла
-    ask  <имя> <вопрос>      — ответить + накопить диалог в паттерн
-    peek <имя> <вопрос>      — ответить без изменения паттерна
-    list                     — показать все паттерны
-    help / exit
+    use <имя>                   — выбрать активный паттерн
+    <вопрос>                    — задать вопрос (следует политике: grow/retrain)
+    ? <вопрос>                  — временно сменить политику (grow↔retrain)
+    route <задача>              — найти файлы для задачи → handoff на Transformer
+    /load <имя> @<файл/папка>   — загрузить файл/папку (без лимита по размеру!)
+    /load ?<имя> @<путь>        — загрузить с принудительным retrain
+    /load <имя> <текст>         — загрузить текст напрямую
+    /list                       — список паттернов
+    /help                       — справка
+    /exit                       — выход
 """
 
 import os
@@ -35,7 +44,7 @@ import pickle
 from pathlib import Path
 from datetime import datetime
 
-import echo_core as core
+import cognit_core as core
 
 # =============================================================================
 # КОНФИГУРАЦИЯ — поменяй MODEL_PATH на свой путь к GGUF
@@ -72,22 +81,42 @@ except ImportError:
           "https://abetlen.github.io/llama-cpp-python/whl/cu121")
     sys.exit(1)
 
-if not os.path.exists(MODEL_PATH):
-    print(f"❌ Модель не найдена: {MODEL_PATH}")
-    print("   Укажите правильный путь в MODEL_PATH")
-    sys.exit(1)
-
-print(f"Загрузка модели: {MODEL_PATH} ...")
-llm = Llama(
-    model_path=MODEL_PATH,
-    n_gpu_layers=N_GPU_LAYERS,
-    n_ctx=N_CTX,
-    verbose=False,
-)
-print(f"✅ Модель загружена  |  Устройство: {'GPU' if N_GPU_LAYERS != 0 else 'CPU'}")
-print(f"   Контекст: ∞ (рекуррентное состояние) | Чанк: {CHUNK_SIZE} токенов")
-print(f"   Паттерны: {PATTERNS_DIR}  [{REPO_NAME} / {BRANCH_NAME}]")
+llm = None  # инициализируется через init_model()
 os.makedirs(PATTERNS_DIR, exist_ok=True)
+
+
+def init_model():
+    """Загружает RWKV-модель в VRAM."""
+    global llm
+    if not os.path.exists(MODEL_PATH):
+        print(f"❌ Модель не найдена: {MODEL_PATH}")
+        print("   Укажите правильный путь в MODEL_PATH")
+        sys.exit(1)
+    print(f"Загрузка модели: {MODEL_PATH} ...")
+    llm = Llama(
+        model_path=MODEL_PATH,
+        n_gpu_layers=N_GPU_LAYERS,
+        n_ctx=N_CTX,
+        verbose=False,
+    )
+    print(f"✅ RWKV загружен  |  {'GPU' if N_GPU_LAYERS != 0 else 'CPU'}")
+    print(f"   Контекст: ∞ (рекуррентное состояние) | Чанк: {CHUNK_SIZE} токенов")
+    print(f"   Паттерны: {PATTERNS_DIR}  [{REPO_NAME} / {BRANCH_NAME}]")
+
+
+def unload_model():
+    """Выгружает модель из VRAM."""
+    global llm
+    if llm is not None:
+        del llm
+        llm = None
+    import gc
+    gc.collect()
+    try:
+        import torch
+        torch.cuda.empty_cache()
+    except ImportError:
+        pass
 
 # =============================================================================
 # РАБОТА С ПАТТЕРНАМИ
@@ -138,7 +167,7 @@ def _question_prompt(question: str) -> str:
     return f"User: {question}\n\nAssistant:"
 
 
-def save_pattern(name: str, text: str, source_files: list[str] = None):
+def save_pattern(name: str, text: str, source_files: list[str] = None, grow_policy: str = None):
     """
     Прогоняет текст через RWKV чанками, сохраняет рекуррентное состояние.
 
@@ -146,8 +175,12 @@ def save_pattern(name: str, text: str, source_files: list[str] = None):
     - Нет ограничения по длине — текст любого размера
     - Состояние после обработки фиксированного размера (не растёт с текстом)
     - Каждый чанк продолжает с того места, где остановился предыдущий
+
+    grow_policy: 'grow' | 'retrain' | None (авто по ветке/пути)
     """
-    print(f"\n📝 Формирование паттерна '{name}'  [RWKV]...")
+    if grow_policy is None:
+        grow_policy = core.default_grow_policy(BRANCH_NAME, source_files or [])
+    print(f"\n📝 Формирование паттерна '{name}'  [RWKV · {grow_policy}]...")
 
     prompt = _context_prompt(text)
     tokens = llm.tokenize(prompt.encode("utf-8"))
@@ -182,6 +215,7 @@ def save_pattern(name: str, text: str, source_files: list[str] = None):
         "model":        MODEL_NAME,
         "repo":         REPO_NAME,
         "branch":       BRANCH_NAME,
+        "grow_policy":  grow_policy,
         "n_tokens":     total,
         "size_kb":      round(size_kb, 1),
         "preview":      text[:300],
@@ -210,7 +244,7 @@ def load_pattern(name: str) -> bool:
             meta = json.load(f)
         if meta.get("backend") == "transformer":
             print(f"⚠️  Паттерн '{name}' создан Transformer-бэкендом.")
-            print("   Загрузите его через echo_poc.py или пересоздайте здесь.")
+            print("   Загрузите его через cognit_transformer.py или пересоздайте здесь.")
             return False
 
     with open(pattern_path, "rb") as f:
@@ -298,41 +332,39 @@ def ask_pattern(name: str, question: str, grow: bool = True):
         print(f"💾 Паттерн обновлён  ({meta['size_kb']} KB, диалогов: {meta['n_asks']})")
 
     # Авто-детекция предложения route от модели
-    _maybe_route(name, question, "".join(collected))
+    return _maybe_route(name, question, "".join(collected))
 
 
-def _maybe_route(pattern_name: str, question: str, response: str):
+def _maybe_route(pattern_name: str, question: str, response: str) -> dict | None:
     """
     Проверяет, предложила ли модель route. Если да — предлагает запустить его прямо сейчас.
-    Ищет 'route' в ответе; если найдено — пробует извлечь задачу из контекста.
+    Возвращает handoff dict или None.
     """
     import re
     lower = response.lower()
     if "route" not in lower:
-        return
+        return None
 
-    # Пробуем вытащить задачу из фразы вида "route <задача>"
     m = re.search(r'route\s+([^\n`<]{5,150})', response, re.IGNORECASE)
     if m:
         suggested_task = m.group(1).strip().rstrip('.,!?`').strip()
     else:
-        suggested_task = question  # используем исходный вопрос как задачу
+        suggested_task = question
 
     try:
         ans = input(f"\n🗺  Запустить route? [{suggested_task[:60]}] [Y/n] ").strip().lower()
     except (KeyboardInterrupt, EOFError):
-        return
+        return None
 
     if ans != "n":
-        route_pattern(pattern_name, suggested_task)
-        _handoff_to_transformer()
+        return route_pattern(pattern_name, suggested_task)
+    return None
 
 
-def route_pattern(index_name: str, task: str):
+def route_pattern(index_name: str, task: str) -> dict | None:
     """
     Использует RWKV-индекс для определения файлов, релевантных задаче.
-    Задаёт структурированный вопрос, парсит пути из ответа.
-    Выводит готовые команды 'context' для echo_poc.py (Transformer).
+    Возвращает handoff dict или None если файлы не определены.
     """
     print(f"\n🗺  Маршрутизация задачи через индекс '{index_name}'...")
     _check_and_refresh(index_name)
@@ -395,18 +427,17 @@ def route_pattern(index_name: str, task: str):
     if not files:
         print("⚠️  Не удалось распознать пути в ответе.")
         print("   Попробуйте переформулировать задачу или уточнить индекс.")
-        return
+        return None
 
     print(f"\n📂 Релевантных файлов: {len(files)}")
-    print("\n   Команды для echo_poc.py (Transformer):")
+    print("\n   Команды для Transformer:")
     for fpath in files:
-        # Имя паттерна — stem без спецсимволов
         stem = Path(fpath).stem.replace("-", "_").replace(".", "_")
         print(f"   /load {stem} @{fpath}")
 
     route_path = core.save_route(PATTERNS_DIR, index_name, task, files)
     print(f"\n💾 Маршрут сохранён: {route_path}")
-    print("   Запусти echo_poc.py — он предложит загрузить эти файлы автоматически.")
+    return _handoff_to_transformer(index_name, task, files)
 
 
 def list_patterns():
@@ -419,8 +450,8 @@ def list_patterns():
 HELP = """
 📖 КОМАНДЫ:
   use <имя>            — выбрать активный паттерн (память модели)
-  <вопрос>             — спросить  (паттерн растёт)
-  ? <вопрос>           — спросить без изменения паттерна
+  <вопрос>             — спросить  (следует политике паттерна: grow сохраняет, retrain — нет)
+  ? <вопрос>           — спросить с временной сменой политики (grow↔retrain)
   route <задача>       — какие файлы нужны? (использует активный паттерн как индекс)
   /load <имя> @<файл>  — загрузить файл как паттерн (без лимита по размеру!)
   /load <имя> <текст>  — загрузить текст как паттерн
@@ -431,7 +462,7 @@ HELP = """
 ПРИМЕР (гибридный режим):
   /load repo @src/        ← проиндексировать всю кодовую базу
   use repo
-  route добавить логин    ← какие файлы нужны? (вывод → скопируй в echo_poc.py)
+  route добавить логин    ← какие файлы нужны? → передаётся Transformer автоматически
   что такое WorldModel?   ← обычный вопрос по индексу
 
 ПРИМЕР (получение задачи от Transformer):
@@ -441,7 +472,7 @@ HELP = """
 """
 
 
-def _load_path(name: str, raw_path: str):
+def _load_path(name: str, raw_path: str, force_policy: str = None):
     """Загружает файл или директорию как паттерн."""
     p = Path(raw_path)
     if p.is_dir():
@@ -459,9 +490,10 @@ def _load_path(name: str, raw_path: str):
             except Exception:
                 pass
         print(f"   Загружаю {len(files)} файлов из {raw_path}/  (git ls-files / rglob)")
-        save_pattern(name, "\n\n---\n\n".join(texts), source_files=paths)
+        save_pattern(name, "\n\n---\n\n".join(texts), source_files=paths, grow_policy=force_policy)
     elif p.is_file():
-        save_pattern(name, p.read_text(encoding="utf-8", errors="ignore"), source_files=[str(p)])
+        save_pattern(name, p.read_text(encoding="utf-8", errors="ignore"),
+                     source_files=[str(p)], grow_policy=force_policy)
     else:
         print(f"❌ Не найден файл или папка: {raw_path}")
 
@@ -470,49 +502,47 @@ def _hint_patterns():
     core.hint_patterns(PATTERNS_DIR)
 
 
-def _handoff_to_transformer():
+def _handoff_to_transformer(index_name: str, task: str, files: list[str]) -> dict:
+    """Передаёт задачу Transformer. Возвращает dict для in-process switch."""
+    return {
+        "action":    "route",
+        "task":      task,
+        "index":     index_name,
+        "files":     files,
+        "routed_at": datetime.now().isoformat(),
+    }
+
+
+def cli_loop(auto_expand: bool = False, pending: dict = None) -> dict | None:
     """
-    После route предлагает передать управление Transformer-модели.
-    Выгружает RWKV из VRAM, запускает echo_poc.py --auto-route в том же терминале.
+    Главный интерактивный цикл RWKV.
+    Возвращает dict handoff (action=route) или None при /exit.
     """
-    print("\n🔄 Передать задачу Transformer (echo_poc.py)? [Y/n] ", end="", flush=True)
-    try:
-        ans = input().strip().lower()
-    except (KeyboardInterrupt, EOFError):
-        return
-
-    if ans == "n":
-        return
-
-    print("   Выгружаю RWKV из VRAM...")
-    global llm
-    del llm
-    import gc
-    gc.collect()
-    try:
-        import torch
-        torch.cuda.empty_cache()
-    except ImportError:
-        pass  # llama-cpp-python без torch тоже освободит память
-
-    print("   Запускаю Transformer... 🤝\n")
-    import subprocess
-    # Запускаем echo_poc.py в том же терминале; rwkv-процесс завершается
-    subprocess.Popen([sys.executable, "echo_poc.py", "--auto-route"])
-    sys.exit(0)
-
-
-def cli_loop(auto_expand: bool = False):
-    print("""
+    print(f"""
 ╔══════════════════════════════════════════════╗
-║  🧠 Cognit — Persistent Neural Context      ║
-║  RWKV · Рекуррентное состояние · ∞ контекст  ║
+║  🧠 Cognit · RWKV ({MODEL_NAME[:20]})
+║  Рекуррентное состояние · ∞ контекст
 ╚══════════════════════════════════════════════╝""")
 
     list_patterns()
 
+    # Авто-маршрут: Transformer вызвал route <задача> → RWKV сразу выполняет и возвращает файлы
+    if pending and pending.get("action") == "expand_route":
+        index = pending.get("index", "")
+        task  = pending.get("task", "")
+        print(f"\n⚡ Авто-маршрут: «{task}»")
+        print(f"   Индекс: {index}")
+        if core.pattern_exists(PATTERNS_DIR, index):
+            result = route_pattern(index, task)
+            return result  # None если файлы не разобраны, dict route если успешно
+        else:
+            print(f"❌ RWKV-паттерн '{index}' не найден в {PATTERNS_DIR}")
+            print(f"   Индекс мог быть удалён или находится на другой ветке.")
+            print(f"   Создай заново: python cognit.py --rwkv → /load repo @src/")
+            return None
+
     # Если Transformer оставил запрос — показываем его
-    expand = core.load_expand_request(PATTERNS_DIR)
+    expand = pending if (pending and pending.get("action") == "expand") else core.load_expand_request(PATTERNS_DIR)
     if expand:
         age_min = int((datetime.now() - datetime.fromisoformat(expand["requested_at"])).total_seconds() / 60)
         print(f"\n💡 Запрос от Transformer ({age_min} мин назад):")
@@ -527,10 +557,15 @@ def cli_loop(auto_expand: bool = False):
         print("\nВыбери паттерн командой 'use <имя>' или '/help' для справки.")
 
     active = None  # текущий активный паттерн
+    active_policy = None
 
     while True:
         try:
-            prompt_str = f"🧠 [{active}]> " if active else "🧠> "
+            if active:
+                marker = "~" if active_policy == "grow" else ""
+                prompt_str = f"🧠 [{active}{marker}]> "
+            else:
+                prompt_str = "🧠> "
             user_input = input(prompt_str).strip()
             if not user_input:
                 continue
@@ -542,7 +577,7 @@ def cli_loop(auto_expand: bool = False):
 
                 if cmd in ("exit", "quit"):
                     print("👋 Выход")
-                    break
+                    return None
 
                 elif cmd == "help":
                     print(HELP)
@@ -553,13 +588,19 @@ def cli_loop(auto_expand: bool = False):
                 elif cmd == "load":
                     if len(parts) < 3:
                         print("❌ Использование: /load <имя> @<файл/папка>  или  /load <имя> <текст>")
+                        print("   Префикс ? форсирует retrain: /load ?name @path")
                         continue
                     name, raw = parts[1], parts[2]
+                    force_policy = None
+                    if name.startswith("?"):
+                        name = name[1:]
+                        force_policy = "retrain"
                     if raw.startswith("@"):
-                        _load_path(name, raw[1:])
+                        _load_path(name, raw[1:], force_policy=force_policy)
                     else:
-                        save_pattern(name, raw)
+                        save_pattern(name, raw, grow_policy=force_policy)
                     active = name  # автоматически переключаемся на новый паттерн
+                    active_policy = (core.read_meta(PATTERNS_DIR, active) or {}).get("grow_policy", "retrain")
                     print(f"   Активный паттерн: {active}")
 
                 else:
@@ -577,7 +618,9 @@ def cli_loop(auto_expand: bool = False):
                     _hint_patterns()
                     continue
                 active = name
-                print(f"✅ Активный паттерн: {active}")
+                active_policy = (core.read_meta(PATTERNS_DIR, active) or {}).get("grow_policy", "retrain")
+                policy_label = " [~grow]" if active_policy == "grow" else " [retrain]"
+                print(f"✅ Активный паттерн: {active}{policy_label}")
 
             # ── route <задача> — использует активный паттерн как индекс ─────
             elif user_input.lower().startswith("route ") or user_input.lower() == "route":
@@ -589,10 +632,11 @@ def cli_loop(auto_expand: bool = False):
                     print("❌ Сначала выбери паттерн-индекс: use <имя>")
                     _hint_patterns()
                     continue
-                route_pattern(active, task)
-                _handoff_to_transformer()  # предложить передать управление
+                result = route_pattern(active, task)
+                if result:
+                    return result
 
-            # ── ? вопрос → peek ──────────────────────────────────────────────
+            # ── ? вопрос → временно сменить политику ────────────────────────
             elif user_input.startswith("?"):
                 question = user_input[1:].strip()
                 if not question:
@@ -602,7 +646,11 @@ def cli_loop(auto_expand: bool = False):
                     print("❌ Сначала выбери паттерн: use <имя>")
                     _hint_patterns()
                     continue
-                ask_pattern(active, question, grow=False)
+                # ? флипает политику: grow→не сохранять, retrain→сохранять
+                flipped_grow = (active_policy == "retrain")
+                result = ask_pattern(active, question, grow=flipped_grow)
+                if result:
+                    return result
 
             # ── просто текст → ask ───────────────────────────────────────────
             else:
@@ -610,11 +658,13 @@ def cli_loop(auto_expand: bool = False):
                     print("❌ Сначала выбери паттерн: use <имя>")
                     _hint_patterns()
                     continue
-                ask_pattern(active, user_input, grow=True)
+                result = ask_pattern(active, user_input, grow=(active_policy == "grow"))
+                if result:
+                    return result
 
         except KeyboardInterrupt:
             print("\n👋 Выход")
-            break
+            return None
         except Exception as e:
             print(f"❌ Ошибка: {e}")
             import traceback
@@ -624,11 +674,12 @@ def cli_loop(auto_expand: bool = False):
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         if sys.argv[1] == "--auto-expand":
-            # Запущен из echo_poc.py после expand — показываем задачу без вопросов
+            init_model()
             cli_loop(auto_expand=True)
         else:
             print(f"Неизвестный флаг: {sys.argv[1]}")
             print("Флаги: --auto-expand")
             sys.exit(1)
     else:
+        init_model()
         cli_loop()

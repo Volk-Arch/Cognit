@@ -3,7 +3,7 @@
 # Copyright (c) 2026 Igor Kriusov <kriusovia@gmail.com>
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 """
-echo_core.py — Общие утилиты для echo_poc.py и echo_rwkv.py
+cognit_core.py — Общие утилиты для cognit_transformer.py и cognit_rwkv.py
 =============================================================
 Не загружает никаких моделей. Чистые функции для работы с:
   - git-контекстом (repo, branch, путь к паттернам)
@@ -99,6 +99,25 @@ def list_pattern_names(patterns_dir: str) -> list[str]:
     ]
 
 
+def default_grow_policy(branch: str, source_paths: list[str]) -> str:
+    """
+    Определяет политику обновления паттерна по умолчанию.
+
+    retrain — пересоздаётся при изменении файлов (диалог сбрасывается):
+      - ветки main / master
+      - паттерны из agents/
+
+    grow — накапливает диалог, не пересоздаётся автоматически:
+      - feature-ветки (всё остальное)
+    """
+    if branch in ("main", "master"):
+        return "retrain"
+    for p in source_paths:
+        if "agents/" in p.replace("\\", "/"):
+            return "retrain"
+    return "grow"
+
+
 # =============================================================================
 # CLI-ХЕЛПЕРЫ
 # =============================================================================
@@ -117,7 +136,9 @@ def print_patterns_list(patterns_dir: str):
         with open(p, encoding="utf-8") as f:
             m = json.load(f)
         backend_tag = f"[{m.get('backend', '?').upper()}]"
-        print(f"\n  • {m['name']}  {backend_tag}  ({m.get('n_tokens','?')} токенов, {m.get('size_kb','?')} KB)")
+        policy = m.get("grow_policy", "retrain")
+        policy_tag = " ~" if policy == "grow" else ""
+        print(f"\n  • {m['name']}{policy_tag}  {backend_tag}  ({m.get('n_tokens','?')} токенов, {m.get('size_kb','?')} KB)")
         print(f"    Сохранён: {m.get('saved_at', '?')[:16]}  |  Диалогов: {m.get('n_asks', 0)}")
         if m.get('preview'):
             print(f"    Превью:   {m['preview'][:80].strip()}...")
