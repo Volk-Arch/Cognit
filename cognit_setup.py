@@ -111,7 +111,7 @@ def setup_config():
 
     t_model_path = _ask(
         "   Путь к Transformer-модели (GGUF)",
-        ex_t.get("model_path", "models/Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf")
+        ex_t.get("model_path", "models/Qwen3-8B-GGUF/Qwen3-8B-Q6_K.gguf")
     )
     r_model_path = _ask(
         "   Путь к RWKV-модели (GGUF)",
@@ -380,7 +380,7 @@ _AGENT_TEMPLATES = {
 - Докстринг для каждой публичной функции и класса (формат Google style):
   ```
   def func(x: int) -> str:
-      """Краткое описание одной строкой.
+      \"\"\"Краткое описание одной строкой.
 
       Args:
           x: описание параметра
@@ -388,7 +388,7 @@ _AGENT_TEMPLATES = {
           описание возвращаемого значения
       Raises:
           ValueError: когда x < 0
-      """
+      \"\"\"
   ```
 - Однострочный докстринг допустим для очевидных геттеров/сеттеров
 
