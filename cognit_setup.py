@@ -106,20 +106,34 @@ def setup_config():
         existing.get("backend", "transformer")
     )
 
-    default_model = {
-        "transformer": "Qwen3-8B-Q4_K_M",
-        "rwkv": "RWKV-6-World-7B-Q4_K_M",
-    }.get(backend, "Qwen3-8B-Q4_K_M")
+    ex_t = existing.get("transformer", {})
+    ex_r = existing.get("rwkv", {})
 
-    model_name = _ask(
-        "   Имя модели (без пути и расширения)",
-        existing.get("model_name", default_model)
+    t_model_path = _ask(
+        "   Путь к Transformer-модели (GGUF)",
+        ex_t.get("model_path", "models/Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf")
+    )
+    r_model_path = _ask(
+        "   Путь к RWKV-модели (GGUF)",
+        ex_r.get("model_path", "models/rwkv/RWKV-6-World-7B-Q4_K_M.gguf")
     )
 
     config = {
-        "backend":    backend,
-        "model_name": model_name,
+        "backend":      backend,
         "patterns_dir": PATTERNS_BASE,
+        "transformer": {
+            "model_path":   t_model_path,
+            "n_gpu_layers": ex_t.get("n_gpu_layers", -1),
+            "n_ctx":        ex_t.get("n_ctx", 8192),
+            "max_tokens":   ex_t.get("max_tokens", 512),
+        },
+        "rwkv": {
+            "model_path":   r_model_path,
+            "n_gpu_layers": ex_r.get("n_gpu_layers", -1),
+            "n_ctx":        ex_r.get("n_ctx", 1024),
+            "max_tokens":   ex_r.get("max_tokens", 512),
+            "chunk_size":   ex_r.get("chunk_size", 512),
+        },
         "_note": (
             "Все участники команды должны использовать одну модель. "
             "Паттерны несовместимы между разными моделями."
@@ -222,6 +236,60 @@ def setup_hook(target_git_root: Path, echo_script_path: Path):
 
 
 # =============================================================================
+# ШАГ 3b: post-checkout хук
+# =============================================================================
+def _make_checkout_hook_script(rwkv_script_path: str) -> str:
+    posix_path = Path(rwkv_script_path).as_posix()
+    return f"""\
+#!/bin/sh
+# Cognit — post-checkout hook
+# Проверяет наличие RWKV-индекса для новой ветки.
+
+PREV_HEAD=$1
+NEW_HEAD=$2
+IS_BRANCH_CHECKOUT=$3
+
+# Запускаем только при смене ветки (не при checkout файла)
+if [ "$IS_BRANCH_CHECKOUT" != "1" ]; then
+    exit 0
+fi
+
+RWKV_SCRIPT="{posix_path}"
+if [ ! -f "$RWKV_SCRIPT" ]; then
+    exit 0
+fi
+
+python "$RWKV_SCRIPT" --check-index 2>/dev/null
+"""
+
+
+def setup_checkout_hook(target_git_root: Path, rwkv_script_path: Path):
+    """Устанавливает post-checkout хук в указанный git-репозиторий."""
+    hook_path = target_git_root / ".git" / "hooks" / "post-checkout"
+
+    if hook_path.exists():
+        overwrite = _ask_yn(
+            f"   post-checkout хук уже существует в {target_git_root.name}. Перезаписать?",
+            default=False,
+        )
+        if not overwrite:
+            print("   Пропускаю.")
+            return
+
+    hook_path.parent.mkdir(parents=True, exist_ok=True)
+    hook_path.write_text(_make_checkout_hook_script(str(rwkv_script_path)), encoding="utf-8")
+
+    try:
+        import stat
+        st = os.stat(hook_path)
+        os.chmod(hook_path, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    except Exception:
+        pass
+
+    print(f"   ✅ post-checkout хук установлен: {hook_path}")
+
+
+# =============================================================================
 # ШАГ 4: S3-инструкции
 # =============================================================================
 def show_s3_instructions(config: dict, repo_name: str):
@@ -258,86 +326,182 @@ def show_s3_instructions(config: dict, repo_name: str):
 
 # Шаблоны для каждого типа агента
 _AGENT_TEMPLATES = {
+    "style/card.md": """\
+# style
+
+Область: стиль кода, именование переменных/функций, форматирование, linting, соглашения по оформлению.
+Применяй когда: вопрос про стиль кода, именование, форматирование, отступы, lint-ошибки, импорты.
+""",
+
+    "arch/card.md": """\
+# arch
+
+Область: архитектура проекта, модули, зависимости, паттерны проектирования, слои, интерфейсы.
+Применяй когда: вопрос о структуре кода, зависимостях между модулями, архитектурных решениях, рефакторинге.
+""",
+
+    "context/card.md": """\
+# context
+
+Область: бизнес-контекст проекта, цели, требования, пользовательские сценарии, причины решений.
+Применяй когда: вопрос о целях проекта, требованиях, бизнес-логике, зачем что-то сделано именно так.
+""",
+
     "style/global.md": """\
 # Глобальный стиль кода
 
-Опиши здесь общие соглашения проекта. Примеры:
+> Замени этот файл правилами своего проекта. Пока действуют разумные дефолты.
 
 ## Именование
-- Переменные и функции: snake_case
-- Классы: PascalCase
-- Константы: UPPER_SNAKE_CASE
-- Приватные поля: _prefix
+- Переменные и функции: `snake_case`
+- Классы и исключения: `PascalCase`
+- Константы модуля: `UPPER_SNAKE_CASE`
+- Приватные методы/поля: `_prefix` (один underscore)
+- Не сокращай без необходимости: `user_id`, не `uid`; `config`, не `cfg`
 
 ## Форматирование
-- Отступы: 4 пробела
+- Отступы: 4 пробела (без табов)
 - Максимальная длина строки: 100 символов
-- Кавычки: двойные для строк
+- Пустые строки: 2 между топ-уровневыми функциями, 1 между методами класса
+- Кавычки: двойные (`"text"`)
 
-## Импорты
-- Стандартная библиотека → сторонние → локальные
-- Не использовать `import *`
+## Импорты (порядок)
+1. Стандартная библиотека (`os`, `sys`, `json`, `pathlib`)
+2. Сторонние пакеты (`requests`, `fastapi`, `pydantic`)
+3. Локальные модули (`from . import ...`)
+Каждая группа разделена пустой строкой. `import *` запрещён.
+
+## Типизация
+- Все публичные функции должны иметь аннотации типов
+- `list[str]` вместо `List[str]` (Python 3.9+), `X | None` вместо `Optional[X]`
+- Для словарей с известной структурой — TypedDict или dataclass
 
 ## Документация
-- Докстринги в формате: ...
+- Докстринг для каждой публичной функции и класса (формат Google style):
+  ```
+  def func(x: int) -> str:
+      """Краткое описание одной строкой.
+
+      Args:
+          x: описание параметра
+      Returns:
+          описание возвращаемого значения
+      Raises:
+          ValueError: когда x < 0
+      """
+  ```
+- Однострочный докстринг допустим для очевидных геттеров/сеттеров
+
+## Антипаттерны (никогда)
+- Голый `except:` без типа — ловить `Exception` явно
+- Mutable default argument: `def f(x=[])` — заменить на `None` + проверку внутри
+- Magic numbers — вынести в именованные константы
+- Вложенность > 3 уровней — вынести во вспомогательную функцию
+- Функции длиннее 60 строк — разбить на части
+- Комментарий "что делает код" вместо "зачем" — переименуй переменную
 """,
 
     "style/commands.md": """\
-# Стиль команд и CLI
+# Стиль CLI и вывода
 
-Опиши соглашения для команд, если проект предоставляет CLI.
+> Актуально если проект предоставляет CLI или интерактивный интерфейс.
 
-## Именование команд
-- ...
+## Именование команд и флагов
+- Команды: глагол или глагол-существительное в `kebab-case` (`run`, `build`, `list-users`)
+- Длинные флаги: `--kebab-case` (`--output-file`, `--dry-run`)
+- Короткие алиасы: однобуквенные для частых флагов (`-v` = `--verbose`, `-o` = `--output`)
+- Позиционные аргументы: только для обязательного главного ввода
 
-## Флаги
-- ...
+## Вывод и UX
+- Успех: без префикса или `✅` для явного подтверждения
+- Предупреждение: `⚠️ ` + описание
+- Ошибка: `❌ ` + что пошло не так + что делать пользователю
+- Прогресс: для операций > 2 сек — spinner или прогресс-бар
+- Verbose режим (`-v` / `--verbose`): дополнительные детали для диагностики
 
-## Примеры вывода
-- ...
+## Коды выхода
+- `0` — успех
+- `1` — ошибка выполнения (файл не найден, сеть недоступна)
+- `2` — неверные аргументы / неправильный вызов
+
+## Обработка ошибок
+- Понятное сообщение + конкретное действие: `❌ Файл не найден: foo.py\n   Проверь путь или запусти: list`
+- Не выводить stack trace пользователю (логировать в файл)
+- Подтверждение для деструктивных операций: `Удалить 5 файлов? [y/N]`
 """,
 
     "arch/overview.md": """\
 # Архитектура проекта
 
+> Замени этот файл описанием реальной структуры. Ниже — типовой шаблон.
+
 ## Структура папок
 ```
 src/
-  ...
+  api/        — HTTP-эндпоинты, роутеры, схемы запрос/ответ
+  core/       — бизнес-логика (без зависимостей на HTTP/DB)
+  db/         — модели, миграции, репозитории
+  services/   — оркестрация: вызывает core + db
+  utils/      — вспомогательные функции без бизнес-логики
+tests/
+  unit/       — тесты core/ и utils/ (без реальной БД)
+  integration/ — тесты с реальными зависимостями
 ```
 
-## Основные модули
-- `module_a` — отвечает за...
-- `module_b` — отвечает за...
+## Слои и зависимости (строго сверху вниз)
+```
+api → services → core
+api → services → db
+```
+- `core/` не импортирует ничего кроме stdlib и утилит
+- `api/` не содержит бизнес-логики — только валидация + вызов service
+- Перекрёстные импорты между слоями запрещены
 
-## Поток данных
-1. ...
-2. ...
-
-## Ключевые зависимости
-- ...
+## Соглашения
+- Одна ответственность на модуль (Single Responsibility)
+- Зависимости передаются через параметры функций, не через глобальные переменные
+- Исключения бизнес-логики наследуются от базового `AppError`
+- Все внешние вызовы (HTTP, очереди, email) — через интерфейсы/обёртки, не напрямую
 
 ## Что избегать
-- ...
+- Круговые импорты (circular imports)
+- Бизнес-логика в слоях `api/` или `db/`
+- God-объекты (класс который знает обо всём)
+- Глобальное изменяемое состояние
 """,
 
     "context/project.md": """\
 # Контекст проекта
 
+> Заполни этот файл информацией о твоём проекте. Это помогает модели давать релевантные ответы.
+
 ## Цель проекта
-...
+[Одно-два предложения: что делает проект и для кого]
+Пример: «REST API для управления задачами команды разработки. Цель — минимальный overhead
+при трекинге, без лишнего UI.»
 
 ## Целевая аудитория
-...
+[Кто пользователи: разработчики / конечные пользователи / внутренние сервисы]
 
-## Текущий статус
-...
+## Технологии
+- Язык: Python 3.11+
+- Основной фреймворк: [FastAPI / Django / Flask / ...]
+- База данных: [PostgreSQL / SQLite / ...]
+- Деплой: [Docker / bare metal / cloud / ...]
 
-## Важные решения и их причины
-- Решение X принято потому что...
+## Принципы разработки
+- Простота важнее универсальности: если есть простое решение — берём его
+- Не добавляем зависимости без явной нужды
+- Покрытие тестами критических путей (core/ и services/)
+- [Добавь специфику проекта]
+
+## Важные решения и причины
+- [Решение A] — потому что [причина]
+- [Мы НЕ используем X] — потому что [причина]
 
 ## Что не делать
-- ...
+- [Специфика проекта: что нельзя, что уже пробовали]
+- Не трогать [чувствительные части] без согласования
 """,
 
     "cognit/handoff.md": """\
@@ -433,16 +597,19 @@ def setup_agents(target_dir: Path | None = None):
     print(f"""
    Структура agents/:
      {agents_path}/
-       style/global.md    — глобальный стиль кода
-       style/commands.md  — стиль команд/CLI
-       arch/overview.md   — архитектура проекта
-       context/project.md — контекст и бизнес-правила
-       cognit/handoff.md  — описание системы двух нейросетей (для handoff)
+       style/global.md    — стиль кода (дефолт: Python best practices)
+       style/commands.md  — стиль CLI-вывода (дефолт: заполнен)
+       arch/overview.md   — архитектура (замени на свою структуру)
+       context/project.md — цели, решения, ограничения (замени)
+       cognit/handoff.md  — система двух нейросетей (не менять)
 
-   Заполни шаблоны → загрузи в echo как паттерны:
-     /load style  @{agents_path}/style/
-     /load arch   @{agents_path}/arch/
-     /load cognit @{agents_path}/cognit/handoff.md
+   Cognit при следующем запуске автоматически:
+     1. Загрузит агентов из этих папок
+     2. Попросит каждого описать себя → сгенерирует card.md
+     3. Соберёт оркестратор из всех card.md
+
+   Можно сразу запустить — дефолтные файлы уже рабочие.
+   Лучший результат — после заполнения arch/ и context/ под свой проект.
 """)
 
     print("   Совет: agents/ нужно добавить в git клиентского проекта.")
@@ -495,26 +662,28 @@ def main():
     config = setup_config()
     setup_gitignore()
 
-    # Абсолютный путь к echo-скрипту (для прописывания в хук)
+    # Абсолютный пути к скриптам (для прописывания в хуки)
     echo_dir = Path(__file__).parent.resolve()
-    backend = config.get("backend", "transformer")
-    script_name = "cognit_rwkv.py" if backend == "rwkv" else "cognit_transformer.py"
-    echo_script = echo_dir / script_name
+    transformer_script = echo_dir / "cognit_transformer.py"
+    rwkv_script        = echo_dir / "cognit_rwkv.py"
 
-    # Хук в основном (клиентском) проекте
+    # Хуки в основном (клиентском) проекте
     client_root = _ask_client_project()
     if client_root:
-        if _ask_yn(f"\n   Установить хук в {client_root.name}?", default=True):
-            setup_hook(client_root, echo_script)
+        if _ask_yn(f"\n   Установить post-commit хук в {client_root.name}?", default=True):
+            setup_hook(client_root, transformer_script)
+        if _ask_yn(f"   Установить post-checkout хук в {client_root.name}? (уведомление о RWKV-индексе)", default=True):
+            setup_checkout_hook(client_root, rwkv_script)
         # Сохраняем путь к клиентскому проекту в .echo.json
         config["client_project"] = str(client_root)
         with open(ECHO_CONFIG, "w", encoding="utf-8") as f:
             json.dump(config, f, ensure_ascii=False, indent=2)
         print(f"   ✅ client_project сохранён в {ECHO_CONFIG}")
 
-    # Хук в самом Cognit-репозитории (опционально)
-    if git_root and _ask_yn("\nУстановить хук и в Cognit-репозитории?", default=False):
-        setup_hook(git_root, echo_script)
+    # Хуки в самом Cognit-репозитории (опционально)
+    if git_root and _ask_yn("\nУстановить хуки и в Cognit-репозитории?", default=False):
+        setup_hook(git_root, transformer_script)
+        setup_checkout_hook(git_root, rwkv_script)
 
     if _ask_yn("\nСоздать папку agents/ с шаблонами?", default=True):
         setup_agents(client_root)  # None если клиент не задан → создаст в CWD

@@ -47,12 +47,23 @@ from datetime import datetime
 import cognit_core as core
 
 # =============================================================================
-# КОНФИГУРАЦИЯ — поменяй MODEL_PATH на свой путь к GGUF
+# КОНФИГУРАЦИЯ — читается из .echo.json (ключ "rwkv"), defaults ниже
 # =============================================================================
-MODEL_PATH    = "models/rwkv/RWKV-6-World-7B-Q4_K_M.gguf"
+def _load_echo_cfg() -> dict:
+    p = Path(".echo.json")
+    if p.exists():
+        try:
+            with open(p, encoding="utf-8") as f:
+                return json.load(f).get("rwkv", {})
+        except Exception:
+            pass
+    return {}
+
+_c            = _load_echo_cfg()
+MODEL_PATH    = _c.get("model_path",   "models/rwkv/RWKV-6-World-7B-Q4_K_M.gguf")
 MODEL_NAME    = Path(MODEL_PATH).stem
-N_GPU_LAYERS  = -1
-MAX_TOKENS    = 512
+N_GPU_LAYERS  = _c.get("n_gpu_layers", -1)
+MAX_TOKENS    = _c.get("max_tokens",   512)
 
 REPO_NAME    = core.git_repo_name()
 BRANCH_NAME  = core.git_branch()
@@ -61,11 +72,11 @@ PATTERNS_DIR = core.make_patterns_dir(REPO_NAME, BRANCH_NAME)
 # RWKV не имеет KV-cache в традиционном смысле.
 # N_CTX здесь — только буфер для генерации ответа, не для истории.
 # Историю хранит рекуррентное состояние (фиксированного размера).
-N_CTX = 1024
+N_CTX = _c.get("n_ctx", 1024)
 
 # Размер чанка при обработке длинного текста.
 # Меньше = больше прогресс-баров, медленнее. 512 — хороший баланс.
-CHUNK_SIZE = 512
+CHUNK_SIZE = _c.get("chunk_size", 512)
 
 # Стоп-последовательности RWKV-World
 STOP_SEQS = ["\nUser:", "\n\nUser:", "\nSystem:"]
@@ -671,14 +682,64 @@ def cli_loop(auto_expand: bool = False, pending: dict = None) -> dict | None:
             traceback.print_exc()
 
 
+def headless_check_index():
+    """
+    Проверяет, есть ли RWKV-паттерн для текущей ветки.
+    Вызывается post-checkout хуком: python cognit_rwkv.py --check-index
+    Выходной код: 0 = есть, 1 = нет (хук печатает подсказку).
+    Модель НЕ загружается.
+    """
+    from pathlib import Path as _Path
+    import json as _json
+
+    has_rwkv = False
+    if _Path(PATTERNS_DIR).exists():
+        for mp in _Path(PATTERNS_DIR).glob("*.json"):
+            try:
+                meta = _json.loads(mp.read_text(encoding="utf-8"))
+                if meta.get("backend") == "rwkv":
+                    has_rwkv = True
+                    break
+            except Exception:
+                pass
+
+    if has_rwkv:
+        print(f"✅ RWKV-индекс найден  [{REPO_NAME}/{BRANCH_NAME}]")
+        sys.exit(0)
+    else:
+        print(f"⚠️  Нет RWKV-индекса для ветки '{BRANCH_NAME}'.")
+        print(f"   Создать: python cognit.py --rwkv → /load repo @src/")
+        sys.exit(1)
+
+
+def headless_build_index(path: str):
+    """
+    Headless: создаёт RWKV-паттерн 'repo' из указанной папки.
+    Вызывается post-checkout хуком: python cognit_rwkv.py --build-index src/
+    Требует загрузки модели (займёт несколько минут).
+    """
+    p = Path(path)
+    if not p.exists():
+        print(f"❌ Путь не найден: {path}")
+        sys.exit(1)
+    print(f"🔄 Headless: создание RWKV-индекса из {path}  [{REPO_NAME}/{BRANCH_NAME}]")
+    init_model()
+    _load_path("repo", path)
+    print("✅ RWKV-индекс создан.")
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         if sys.argv[1] == "--auto-expand":
             init_model()
             cli_loop(auto_expand=True)
+        elif sys.argv[1] == "--check-index":
+            headless_check_index()   # модель не нужна
+        elif sys.argv[1] == "--build-index" and len(sys.argv) > 2:
+            headless_build_index(sys.argv[2])
         else:
             print(f"Неизвестный флаг: {sys.argv[1]}")
-            print("Флаги: --auto-expand")
+            print("Флаги: --auto-expand, --check-index, --build-index <путь>")
             sys.exit(1)
     else:
         init_model()

@@ -25,13 +25,14 @@ Cognit — Persistent Neural Context (Transformer)
     ? <вопрос>                  — временно сменить политику (grow↔retrain)
     expand <задача>             — передать задачу в RWKV (handoff)
     route <задача>              — найти файлы через RWKV-индекс → вернуться с файлами
-    /load <имя> @<файл/папка>   — загрузить файл/папку как паттерн
-    /load ?<имя> @<путь>        — загрузить с принудительным retrain
-    /load <имя> <текст>         — загрузить текст напрямую
+    /load <имя> @<путь>          — загрузить файл/папку как паттерн
+    /load <имя> @<д1> @<д2>     — composite: несколько источников, один eval-проход
+    /load ?<имя> @<путь>         — загрузить с принудительным retrain
+    /load <имя> <текст>          — загрузить текст напрямую
     /list                       — список паттернов
     /patch                      — применить diff из последнего ответа к файлу
     /patch @<файл>              — применить к конкретному файлу
-    /agents                     — список агентов из agents/
+    /agents                     — список агентов из agents/ (авто-создаются при старте)
     /agent <имя> [имя2 ...]     — включить ambient (все вопросы через [паттерн + агенты])
     /agent off                  — выключить ambient
     /review @<файл>             — ревью файла (агент style, эфемерно)
@@ -55,13 +56,14 @@ from cognit_patch import _extract_diff, _diff_target, apply_patch as _apply_patc
 from cognit_agents import echo_config as _echo_config, list_agents as _list_agents, read_agent_text as _read_agent_text
 
 # =============================================================================
-# КОНФИГУРАЦИЯ — поменяй MODEL_PATH на свой путь к GGUF
+# КОНФИГУРАЦИЯ — читается из .echo.json (ключ "transformer"), defaults ниже
 # =============================================================================
-MODEL_PATH   = "models/Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf"
+_c           = _echo_config().get("transformer", {})
+MODEL_PATH   = _c.get("model_path",   "models/Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf")
 MODEL_NAME   = Path(MODEL_PATH).stem
-N_CTX        = 8192
-N_GPU_LAYERS = -1
-MAX_TOKENS   = 512
+N_CTX        = _c.get("n_ctx",        8192)
+N_GPU_LAYERS = _c.get("n_gpu_layers", -1)
+MAX_TOKENS   = _c.get("max_tokens",   512)
 
 REPO_NAME    = core.git_repo_name()
 BRANCH_NAME  = core.git_branch()
@@ -343,6 +345,74 @@ def ask_pattern(name: str, question: str, grow: bool = True) -> str:
     return response, handoff  # tuple[str, dict | None]
 
 
+def _peek_pattern(name: str, prompt: str) -> str | None:
+    """
+    Тихий инференс на паттерне без вывода и без сохранения состояния.
+    Используется для роутинговых запросов к оркестратору.
+    """
+    pkl = Path(PATTERNS_DIR) / f"{name}.pkl"
+    if not pkl.exists():
+        return None
+    try:
+        with open(pkl, "rb") as f:
+            state = pickle.load(f)
+        llm.load_state(state)
+        q_tokens = llm.tokenize(_question_prompt(prompt).encode("utf-8"), add_bos=False)
+        collected = []
+        for token_id in llm.generate(q_tokens, reset=False, temp=0.1, top_p=0.9):
+            piece = llm.detokenize([token_id]).decode("utf-8", errors="replace")
+            collected.append(piece)
+            full = "".join(collected)
+            if any(stop in full[-60:] for stop in STOP_TOKENS):
+                break
+            if len(collected) >= 120:
+                break
+        response = "".join(collected)
+        # Qwen3 оборачивает reasoning в <think>...</think> — берём только ответ
+        if "</think>" in response:
+            response = response.split("</think>", 1)[1].strip()
+        for stop in STOP_TOKENS:
+            if stop in response:
+                response = response[:response.index(stop)]
+        return response.strip()
+    except Exception:
+        return None
+
+
+def _generate_agent_card(name: str, agent_dir: Path):
+    """
+    Генерирует card.md для агента через его собственный KV-cache.
+    Модель описывает себя: область знаний и когда её надо активировать.
+    Вызывается после создания паттерна если card.md не существует.
+    """
+    card_path = agent_dir / "card.md"
+    if card_path.exists():
+        return
+    if not core.pattern_exists(PATTERNS_DIR, name):
+        return
+
+    prompt = (
+        f"Ты агент '{name}'. Опиши себя для системы автоматического роутинга.\n"
+        "Ответь ровно двумя строками:\n"
+        "Область: [что ты знаешь — одна строка]\n"
+        "Применяй когда: [в каких ситуациях активировать — одна строка]\n"
+        "Только эти две строки. Без комментариев."
+    )
+    print(f"   🃏 Генерирую card.md для {name}...", end=" ", flush=True)
+    response = _peek_pattern(name, prompt)
+    if not response:
+        print("(нет ответа)")
+        return
+
+    lines = [l.strip() for l in response.splitlines() if l.strip() and not l.startswith("<")]
+    card_lines = [l for l in lines if l.startswith("Область:") or l.startswith("Применяй когда:")]
+    if not card_lines:
+        card_lines = lines[:3]  # fallback: первые строки
+
+    card_path.write_text(f"# {name}\n\n" + "\n".join(card_lines) + "\n", encoding="utf-8")
+    print("✓")
+
+
 def _maybe_expand(pattern_name: str, question: str, response: str) -> dict | None:
     """
     Проверяет, предложила ли модель expand. Если да — предлагает запустить его.
@@ -367,6 +437,45 @@ def _maybe_expand(pattern_name: str, question: str, response: str) -> dict | Non
     if ans != "n":
         return _handoff_to_rwkv(pattern_name, suggested_task)
     return None
+
+
+def _maybe_route_suggestion(question: str, response: str) -> dict | None:
+    """
+    Проверяет, предложила ли модель route (нужны конкретные файлы).
+    Работает только если есть RWKV-индекс.
+    Возвращает expand_route handoff или None.
+    """
+    lower = response.lower()
+    if "route" not in lower:
+        return None
+
+    index = _find_rwkv_index()
+    if not index:
+        return None  # нет индекса — нечего предлагать
+
+    m = re.search(r'route\s+([^\n`<]{5,150})', response, re.IGNORECASE)
+    suggested_task = m.group(1).strip().rstrip('.,!?`').strip() if m else question
+
+    try:
+        ans = input(f"\n🗺  Запустить route? [{suggested_task[:60]}] [Y/n] ").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        return None
+
+    if ans != "n":
+        return {"action": "expand_route", "task": suggested_task, "index": index}
+    return None
+
+
+def _maybe_chain_handoff(active: str, question: str, response: str) -> dict | None:
+    """
+    После ответа агента проверяет: предложил ли он expand или route.
+    Возвращает первый найденный handoff или None.
+    Вызывается после _chain_ask чтобы цепочки агентов могли запускать переключение.
+    """
+    handoff = _maybe_expand(active, question, response)
+    if handoff:
+        return handoff
+    return _maybe_route_suggestion(question, response)
 
 
 def list_patterns():
@@ -482,8 +591,9 @@ HELP = """
   ? <вопрос>           — спросить с временной сменой политики (grow↔retrain)
   expand <задача>      — передать задачу в RWKV и выгрузиться
   route <задача>       — найти файлы через RWKV-индекс → вернуться с файлами
-  /load <имя> @<файл>  — загрузить файл как паттерн
-  /load <имя> <текст>  — загрузить текст как паттерн
+  /load <имя> @<файл>        — загрузить файл как паттерн
+  /load <имя> @<д1> @<д2>   — composite: несколько папок в одном eval-проходе
+  /load <имя> <текст>        — загрузить текст как паттерн
   /patch               — применить unified diff из последнего ответа к файлу
   /patch @<файл>       — применить к конкретному файлу (override)
   /agents              — список доступных агентов
@@ -536,8 +646,156 @@ def _load_path(name: str, raw_path: str, force_policy: str = None):
         print(f"❌ Не найден файл или папка: {raw_path}")
 
 
+def _load_mix(name: str, raw_paths: list[str], force_policy: str = None):
+    """Загружает несколько файлов/папок как единый composite паттерн."""
+    all_texts: list[str] = []
+    all_sources: list[str] = []
+    for raw_path in raw_paths:
+        p = Path(raw_path)
+        if p.is_dir():
+            files = core.collect_text_files(p)
+            if not files:
+                print(f"   ⚠️  Папка пуста или нет подходящих файлов: {raw_path}")
+                continue
+            header = f"# {p.name}  ({p.resolve()})\n"
+            block_texts = [header]
+            for f in files:
+                try:
+                    block_texts.append(
+                        f"# {f.relative_to(p)}\n\n{f.read_text(encoding='utf-8', errors='ignore')}"
+                    )
+                    all_sources.append(str(f))
+                except Exception:
+                    pass
+            all_texts.append("\n\n---\n\n".join(block_texts))
+            print(f"   + {p.name}/  ({len(files)} файлов)")
+        elif p.is_file():
+            all_texts.append(p.read_text(encoding="utf-8", errors="ignore"))
+            all_sources.append(str(p))
+            print(f"   + {p.name}")
+        else:
+            print(f"   ⚠️  Не найден: {raw_path}")
+    if not all_texts:
+        print("❌ Ни один путь не содержит файлов.")
+        return
+    combined = "\n\n===\n\n".join(all_texts)
+    print(f"   Composite: {name}  (источников: {len(raw_paths)}, файлов: {len(all_sources)})")
+    save_pattern(name, combined, source_files=all_sources, grow_policy=force_policy)
+
+
 def _hint_patterns():
     core.hint_patterns(PATTERNS_DIR)
+
+
+def _auto_init_agents():
+    """
+    При старте проверяет агентов из agents/ клиентского проекта.
+    Если паттерн агента не создан — создаёт автоматически.
+    Также создаёт оркестратор-паттерн из card.md файлов агентов.
+    Вызывается один раз в начале cli_loop().
+    """
+    cfg = _echo_config()
+    client = cfg.get("client_project", "")
+
+    agents = _list_agents(PATTERNS_DIR)
+    missing = [(name, loaded) for name, loaded in agents if not loaded]
+
+    if missing and client:
+        print(f"\n🔄 Авто-инициализация агентов ({len(missing)} из {len(agents)})...")
+        for name, _ in missing:
+            agent_dir = Path(client) / "agents" / name
+            if agent_dir.exists():
+                print(f"   Загружаю агента: {name}  ({agent_dir})")
+                _load_path(name, str(agent_dir))
+                # Генерируем card.md из KV-cache если его ещё нет
+                _generate_agent_card(name, agent_dir)
+            else:
+                print(f"   ⚠️  Папка агента не найдена: {agent_dir}")
+        print()
+
+    # Генерируем card.md для уже загруженных агентов у которых карточки нет
+    if client:
+        agents_root = Path(client) / "agents"
+        for name, loaded in agents:
+            if not loaded:
+                continue
+            agent_dir = agents_root / name
+            if agent_dir.exists() and not (agent_dir / "card.md").exists():
+                _generate_agent_card(name, agent_dir)
+
+    # Оркестратор: создаём из card.md если паттерна ещё нет
+    if client and not core.pattern_exists(PATTERNS_DIR, "orchestrator"):
+        agents_root = Path(client) / "agents"
+        cards = sorted(agents_root.glob("*/card.md")) if agents_root.exists() else []
+        if cards:
+            combined = "\n\n---\n\n".join(
+                c.read_text(encoding="utf-8", errors="ignore") for c in cards
+            )
+            print(f"   🎯 Создаю оркестратор из {len(cards)} card.md...")
+            save_pattern("orchestrator", combined, grow_policy="retrain")
+            print()
+
+
+# Ключевые слова для авто-подбора агентов.
+# Агент активируется если вопрос содержит хотя бы одно слово из списка.
+# Пополняется при появлении новых агентов — или через keywords.txt в папке агента.
+_AGENT_KEYWORDS: dict[str, list[str]] = {
+    "style":   ["стиль", "style", "форматирование", "naming", "конвенция",
+                "оформление", "lint", "pep8", "отступ", "импорт"],
+    "arch":    ["архитектур", "arch", "структур", "design", "паттерн", "pattern",
+                "зависимост", "модул", "слой", "layer", "интерфейс"],
+    "context": ["контекст", "context", "проект", "цель", "требовани", "бизнес",
+                "зачем", "почему", "задача"],
+}
+
+
+def _load_agent_keywords(agent_name: str) -> list[str]:
+    """Читает keywords.txt из папки агента, если есть. Дополняет _AGENT_KEYWORDS."""
+    cfg = _echo_config()
+    kw_path = Path(cfg.get("client_project", "")) / "agents" / agent_name / "keywords.txt"
+    if not kw_path.exists():
+        return []
+    return [line.strip() for line in kw_path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.startswith("#")]
+
+
+def _suggest_agents(question: str) -> list[str]:
+    """
+    Подбирает агентов по ключевым словам в вопросе.
+    Только среди агентов у которых уже есть загруженный паттерн.
+    """
+    q = question.lower()
+    suggested = []
+    for agent_name, keywords in _AGENT_KEYWORDS.items():
+        if not core.pattern_exists(PATTERNS_DIR, agent_name):
+            continue
+        extra = _load_agent_keywords(agent_name)
+        if any(kw in q for kw in keywords + extra):
+            suggested.append(agent_name)
+    return suggested
+
+
+def _orchestrator_agents(question: str, available: list[str]) -> list[str]:
+    """
+    Запрашивает оркестратор-паттерн для выбора агентов под конкретный вопрос.
+    Возвращает список агентов или [] если оркестратора нет либо он не нужен.
+    """
+    if not core.pattern_exists(PATTERNS_DIR, "orchestrator") or not available:
+        return []
+    routing_prompt = (
+        f"Вопрос пользователя: \"{question[:200]}\"\n"
+        f"Доступные агенты: {', '.join(available)}\n"
+        "Какие агенты нужны? Перечисли только имена через запятую. "
+        "Если ни один не нужен — ответь: none"
+    )
+    print("   🎯 Оркестратор...", end=" ", flush=True)
+    response = _peek_pattern("orchestrator", routing_prompt)
+    if not response:
+        print()
+        return []
+    result = [n for n in available if n.lower() in response.lower()]
+    print(", ".join(result) if result else "none")
+    return result
 
 
 def _find_rwkv_index() -> str | None:
@@ -583,6 +841,7 @@ def cli_loop(auto_route: bool = False, pending: dict = None) -> dict | None:
 ╚══════════════════════════════════════════════╝""")
 
     list_patterns()
+    _auto_init_agents()
 
     # Если RWKV оставил маршрут — загружаем файлы (авто или с вопросом)
     active = None
@@ -656,17 +915,21 @@ def cli_loop(auto_route: bool = False, pending: dict = None) -> dict | None:
                 elif cmd == "load":
                     if len(parts) < 3:
                         print("❌ Использование: /load <имя> @<файл/папка>  или  /load <имя> <текст>")
+                        print("   Несколько путей: /load <имя> @dir1/ @dir2/  (composite паттерн)")
                         print("   Префикс ? форсирует retrain: /load ?name @path")
                         continue
-                    name, raw = parts[1], parts[2]
+                    name = parts[1]
                     force_policy = None
                     if name.startswith("?"):
                         name = name[1:]
                         force_policy = "retrain"
-                    if raw.startswith("@"):
-                        _load_path(name, raw[1:], force_policy=force_policy)
+                    at_paths = [p[1:] for p in parts[2:] if p.startswith("@")]
+                    if len(at_paths) > 1:
+                        _load_mix(name, at_paths, force_policy=force_policy)
+                    elif len(at_paths) == 1:
+                        _load_path(name, at_paths[0], force_policy=force_policy)
                     else:
-                        save_pattern(name, raw, grow_policy=force_policy)
+                        save_pattern(name, " ".join(parts[2:]), grow_policy=force_policy)
                     active = name  # автоматически переключаемся на новый паттерн
                     active_policy = (core.read_meta(PATTERNS_DIR, active) or {}).get("grow_policy", "retrain")
                     print(f"   Активный паттерн: {active}")
@@ -790,6 +1053,9 @@ def cli_loop(auto_route: bool = False, pending: dict = None) -> dict | None:
                     agent = _find_or_load_agent(agent_name)
                     if agent:
                         last_response = _chain_ask(agent, content, question)
+                        handoff = _maybe_chain_handoff(active or agent, question, last_response)
+                        if handoff:
+                            return handoff
 
                 else:
                     print(f"❌ Неизвестная команда '/{cmd}'. Введите '/help'.")
@@ -820,12 +1086,19 @@ def cli_loop(auto_route: bool = False, pending: dict = None) -> dict | None:
                     print("❌ Сначала выбери паттерн: use <имя>")
                     _hint_patterns()
                     continue
-                if ambient_agents:
+                _loaded = [n for n, ok in _list_agents(PATTERNS_DIR) if ok and n != "orchestrator"]
+                effective_agents = ambient_agents or _orchestrator_agents(question, _loaded) or _suggest_agents(question)
+                if effective_agents:
+                    if not ambient_agents:
+                        print(f"🤖 Авто-агенты: {', '.join(effective_agents)}")
                     agent_text = "\n\n---\n\n".join(
-                        t for name in ambient_agents if (t := _read_agent_text(name))
+                        t for name in effective_agents if (t := _read_agent_text(name))
                     )
                     if agent_text:
                         last_response = _chain_ask(active, agent_text, question)
+                        handoff = _maybe_chain_handoff(active, question, last_response)
+                        if handoff:
+                            return handoff
                     else:
                         last_response, handoff = ask_pattern(active, question, grow=False)
                         if handoff:
@@ -873,12 +1146,19 @@ def cli_loop(auto_route: bool = False, pending: dict = None) -> dict | None:
                     print("❌ Сначала выбери паттерн: use <имя>")
                     _hint_patterns()
                     continue
-                if ambient_agents:
+                _loaded = [n for n, ok in _list_agents(PATTERNS_DIR) if ok and n != "orchestrator"]
+                effective_agents = ambient_agents or _orchestrator_agents(user_input, _loaded) or _suggest_agents(user_input)
+                if effective_agents:
+                    if not ambient_agents:
+                        print(f"🤖 Авто-агенты: {', '.join(effective_agents)}")
                     agent_text = "\n\n---\n\n".join(
-                        t for name in ambient_agents if (t := _read_agent_text(name))
+                        t for name in effective_agents if (t := _read_agent_text(name))
                     )
                     if agent_text:
                         last_response = _chain_ask(active, agent_text, user_input)
+                        handoff = _maybe_chain_handoff(active, user_input, last_response)
+                        if handoff:
+                            return handoff
                     else:
                         last_response, handoff = ask_pattern(active, user_input, grow=(active_policy == "grow"))
                         if handoff:
