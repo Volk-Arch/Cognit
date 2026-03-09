@@ -122,26 +122,25 @@ def default_grow_policy(branch: str, source_paths: list[str]) -> str:
 # CLI-ХЕЛПЕРЫ
 # =============================================================================
 def print_patterns_list(patterns_dir: str):
-    """Показывает все паттерны с метаданными."""
+    """Показывает все паттерны — одна строка на паттерн."""
     metas = [
         p for p in sorted(Path(patterns_dir).glob("*.json"))
         if not p.stem.startswith("_")
     ]
     if not metas:
-        print("📂 Нет сохранённых паттернов.")
+        print("   Паттернов нет — загрузи: /load <имя> @<файл>")
         return
 
-    print(f"\n📋 Паттернов: {len(metas)}")
+    print(f"📋 Паттернов: {len(metas)}")
     for p in metas:
         with open(p, encoding="utf-8") as f:
             m = json.load(f)
-        backend_tag = f"[{m.get('backend', '?').upper()}]"
-        policy = m.get("grow_policy", "retrain")
-        policy_tag = " ~" if policy == "grow" else ""
-        print(f"\n  • {m['name']}{policy_tag}  {backend_tag}  ({m.get('n_tokens','?')} токенов, {m.get('size_kb','?')} KB)")
-        print(f"    Сохранён: {m.get('saved_at', '?')[:16]}  |  Диалогов: {m.get('n_asks', 0)}")
-        if m.get('preview'):
-            print(f"    Превью:   {m['preview'][:80].strip()}...")
+        backend = m.get("backend", "?")[0].upper()   # T / R
+        policy  = "~" if m.get("grow_policy") == "grow" else ""
+        saved   = m.get("saved_at", "")[:10]          # 2026-03-09
+        asks    = m.get("n_asks", 0)
+        asks_s  = f"  {asks}д" if asks else ""
+        print(f"  • {m['name']}{policy}  [{backend}]  {saved}{asks_s}")
 
 
 def hint_patterns(patterns_dir: str):

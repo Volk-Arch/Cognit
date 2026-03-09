@@ -237,9 +237,7 @@ def save_pattern(name: str, text: str, source_files: list[str] = None, grow_poli
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
-    print(f"✅ Паттерн сохранён: {pattern_path}  ({size_kb:.0f} KB)")
-    print(f"   Обработано токенов: {total}  |  Размер паттерна фиксирован (не зависит от объёма текста)")
-    print(f"   Вопросы: ask {name} <вопрос>")
+    print(f"✅ {name}  ({size_kb:.0f} KB, {total} tok)")
 
 
 def load_pattern(name: str) -> bool:
@@ -272,7 +270,7 @@ def ask_pattern(name: str, question: str, grow: bool = True):
     grow=True:  после ответа состояние обновляется (растущая сессия).
     grow=False: состояние не меняется (peek).
     """
-    print(f"\n💬 Загрузка паттерна '{name}'...")
+    print(f"💬 [{name}]", end="  ", flush=True)
     _check_and_refresh(name)
     if not load_pattern(name):
         return
@@ -280,7 +278,7 @@ def ask_pattern(name: str, question: str, grow: bool = True):
     q_prompt = _question_prompt(question)
     q_tokens = llm.tokenize(q_prompt.encode("utf-8"), add_bos=False)
 
-    print(f"   Токенов вопроса: {len(q_tokens)}  (контекст не передаётся повторно!)")
+    print(f"+{len(q_tokens)} tok")
     print(f"\n❓ {question}")
     print("─" * 50)
 
@@ -340,7 +338,7 @@ def ask_pattern(name: str, question: str, grow: bool = True):
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
 
-        print(f"💾 Паттерн обновлён  ({meta['size_kb']} KB, диалогов: {meta['n_asks']})")
+        print(f"💾 {name}  ({meta['size_kb']} KB, {meta['n_asks']}д)")
 
     # Авто-детекция предложения route от модели
     return _maybe_route(name, question, "".join(collected))
@@ -440,7 +438,30 @@ def route_pattern(index_name: str, task: str) -> dict | None:
         print("   Попробуйте переформулировать задачу или уточнить индекс.")
         return None
 
-    print(f"\n📂 Релевантных файлов: {len(files)}")
+    # Дедупликация и проверка существования путей
+    seen = set()
+    valid_files, ghost_files = [], []
+    for fpath in files:
+        if fpath in seen:
+            continue
+        seen.add(fpath)
+        if os.path.exists(fpath):
+            valid_files.append(fpath)
+        else:
+            ghost_files.append(fpath)
+
+    if ghost_files:
+        print(f"\n⚠️  {len(ghost_files)} путей не существует (модель угадала пути):")
+        for f in ghost_files:
+            print(f"   ✗ {f}")
+
+    if not valid_files:
+        print("❌ Ни один файл не найден. RWKV-индекс устарел или проект не проиндексирован.")
+        print("   Пересоздай индекс: /load repo @<путь к проекту>")
+        return None
+
+    files = valid_files
+    print(f"\n📂 Найдено файлов: {len(files)}")
     print("\n   Команды для Transformer:")
     for fpath in files:
         stem = Path(fpath).stem.replace("-", "_").replace(".", "_")
@@ -496,8 +517,9 @@ def _load_path(name: str, raw_path: str, force_policy: str = None):
         texts.append(header)
         for f in files:
             try:
-                texts.append(f"# {f.relative_to(p)}\n\n{f.read_text(encoding='utf-8', errors='ignore')}")
-                paths.append(str(f))
+                # Абсолютный путь в заголовке — RWKV запомнит его точно и не будет угадывать
+                texts.append(f"# {f.resolve()}\n\n{f.read_text(encoding='utf-8', errors='ignore')}")
+                paths.append(str(f.resolve()))
             except Exception:
                 pass
         print(f"   Загружаю {len(files)} файлов из {raw_path}/  (git ls-files / rglob)")
@@ -513,15 +535,77 @@ def _hint_patterns():
     core.hint_patterns(PATTERNS_DIR)
 
 
-def _handoff_to_transformer(index_name: str, task: str, files: list[str]) -> dict:
+def _handoff_to_transformer(index_name: str, task: str, files: list[str],
+                            original_question: str = "", auto: bool = False) -> dict:
     """Передаёт задачу Transformer. Возвращает dict для in-process switch."""
     return {
-        "action":    "route",
-        "task":      task,
-        "index":     index_name,
-        "files":     files,
-        "routed_at": datetime.now().isoformat(),
+        "action":            "route",
+        "task":              task,
+        "index":             index_name,
+        "files":             files,
+        "routed_at":         datetime.now().isoformat(),
+        "original_question": original_question,
+        "auto":              auto,
     }
+
+
+def _find_rwkv_repo_pattern() -> bool:
+    """Проверяет наличие RWKV-паттерна 'repo' в текущей ветке."""
+    if not core.pattern_exists(PATTERNS_DIR, "repo"):
+        return False
+    meta = core.read_meta(PATTERNS_DIR, "repo") or {}
+    return meta.get("backend") == "rwkv"
+
+
+def _get_client_project() -> str:
+    """Возвращает путь к клиентскому проекту из .echo.json."""
+    try:
+        return json.loads(Path(".echo.json").read_text(encoding="utf-8")).get("client_project", "")
+    except Exception:
+        return ""
+
+
+def _auto_expand_flow(task: str, original_question: str = "") -> dict | None:
+    """
+    Zero-touch expand: строит RWKV-индекс если нет, авто-маршрутизирует задачу.
+
+    Алгоритм:
+      1. Ищем RWKV-паттерн 'repo'. Если нет — индексируем client_project.
+      2. route_pattern("repo", task) → список файлов.
+      3. Возвращаем handoff dict с флагом auto=True и original_question.
+
+    Возвращает dict для Transformer или None при ошибке.
+    """
+    # 1. Проверяем/создаём RWKV-индекс repo
+    if _find_rwkv_repo_pattern():
+        print("\n✅ Используем RWKV-индекс 'repo'.")
+    else:
+        client = _get_client_project()
+        if not client:
+            client = "."
+        client_path = Path(client)
+        if not client_path.exists():
+            print(f"⚠️  client_project не найден: {client}")
+            print("   Укажи путь в .echo.json → client_project  или создай вручную:")
+            print("   /load repo @<путь к проекту>")
+            return None
+
+        print(f"\n🔄 Индексирую проект: {client_path.resolve()}")
+        print("   (первый запуск займёт несколько минут — потом мгновенно)")
+        _load_path("repo", str(client_path))
+
+    # 2. Авто-маршрутизация
+    # Оригинальный вопрос пользователя конкретнее, чем абстрактный task от модели
+    route_task = original_question if original_question else task
+    print(f"\n🎯 Ищу файлы для: «{route_task}»")
+    result = route_pattern("repo", route_task)
+
+    # 3. Пробрасываем original_question и флаг auto в route dict
+    if result:
+        result["original_question"] = original_question
+        result["auto"] = True
+
+    return result
 
 
 def cli_loop(auto_expand: bool = False, pending: dict = None) -> dict | None:
@@ -529,11 +613,7 @@ def cli_loop(auto_expand: bool = False, pending: dict = None) -> dict | None:
     Главный интерактивный цикл RWKV.
     Возвращает dict handoff (action=route) или None при /exit.
     """
-    print(f"""
-╔══════════════════════════════════════════════╗
-║  🧠 Cognit · RWKV ({MODEL_NAME[:20]})
-║  Рекуррентное состояние · ∞ контекст
-╚══════════════════════════════════════════════╝""")
+    print(f"\n🧠 RWKV · {MODEL_NAME[:28]} · {REPO_NAME}/{BRANCH_NAME}")
 
     list_patterns()
 
@@ -552,7 +632,7 @@ def cli_loop(auto_expand: bool = False, pending: dict = None) -> dict | None:
             print(f"   Создай заново: python cognit.py --rwkv → /load repo @src/")
             return None
 
-    # Если Transformer оставил запрос — показываем его
+    # Если Transformer оставил запрос — авто-expand (zero-touch)
     expand = pending if (pending and pending.get("action") == "expand") else core.load_expand_request(PATTERNS_DIR)
     if expand:
         age_min = int((datetime.now() - datetime.fromisoformat(expand["requested_at"])).total_seconds() / 60)
@@ -564,6 +644,15 @@ def cli_loop(auto_expand: bool = False, pending: dict = None) -> dict | None:
             print("   Файлы из контекста:")
             for src in expand["from_sources"]:
                 print(f"   • {src}")
+
+        # Zero-touch: строим индекс если нет → маршрутизируем → отдаём Transformer
+        result = _auto_expand_flow(
+            expand.get("task", ""),
+            expand.get("original_question", ""),
+        )
+        if result:
+            return result
+        print("⚠️  Авто-expand не дал результата. Переходим в ручной режим.")
     else:
         print("\nВыбери паттерн командой 'use <имя>' или '/help' для справки.")
 
@@ -726,6 +815,33 @@ def headless_build_index(path: str):
     init_model()
     _load_path("repo", path)
     print("✅ RWKV-индекс создан.")
+
+
+def headless_route(task: str, original_question: str = "") -> dict | None:
+    """
+    Headless expand: строит RWKV-индекс если нет, маршрутизирует задачу.
+    Вызывается из cognit.py при expand — без интерактивного CLI.
+    Возвращает route dict или None.
+    """
+    return _auto_expand_flow(task, original_question)
+
+
+def headless_route_with_index(index_name: str, task: str,
+                               original_question: str = "") -> dict | None:
+    """
+    Headless route: маршрутизирует через существующий RWKV-индекс.
+    Вызывается из cognit.py при expand_route — без интерактивного CLI.
+    """
+    if not core.pattern_exists(PATTERNS_DIR, index_name):
+        print(f"❌ RWKV-индекс '{index_name}' не найден")
+        print(f"   Создай: python cognit.py --rwkv → /load repo @<проект>")
+        return None
+    print(f"\n🎯 Маршрутизирую через индекс '{index_name}'...")
+    result = route_pattern(index_name, task)
+    if result and original_question:
+        result["original_question"] = original_question
+        result["auto"] = True
+    return result
 
 
 if __name__ == "__main__":

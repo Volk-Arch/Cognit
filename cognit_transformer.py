@@ -234,8 +234,7 @@ def save_pattern(name: str, text: str, source_files: list[str] = None, grow_poli
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
-    print(f"✅ Паттерн сохранён: {pattern_path}  ({size_kb:.0f} KB)")
-    print(f"   Вопросы: ask {name} <вопрос>")
+    print(f"✅ {name}  ({size_kb:.0f} KB, {llm.n_tokens} tok)")
 
 
 def load_pattern(name: str) -> bool:
@@ -260,7 +259,7 @@ def ask_pattern(name: str, question: str, grow: bool = True) -> str:
     grow=True (по умолчанию): после ответа KV-cache обновляется —
     паттерн накапливает весь диалог (растущая сессия).
     """
-    print(f"\n💬 Загрузка паттерна '{name}'...")
+    print(f"💬 [{name}]", end="  ", flush=True)
     _check_and_refresh(name)
     if not load_pattern(name):
         return
@@ -269,7 +268,7 @@ def ask_pattern(name: str, question: str, grow: bool = True) -> str:
     question_prompt = _question_prompt(question)
     q_tokens = llm.tokenize(question_prompt.encode("utf-8"), add_bos=False)
 
-    print(f"   Токенов вопроса: {len(q_tokens)}  (контекст не передаётся повторно!)")
+    print(f"+{len(q_tokens)} tok")
     print(f"\n❓ {question}")
     print("─" * 50)
 
@@ -306,6 +305,13 @@ def ask_pattern(name: str, question: str, grow: bool = True) -> str:
             break
         if len(collected) >= MAX_TOKENS:
             break
+        # Детектор зацикливания: последние 40 токенов == предыдущие 40
+        if len(collected) >= 80:
+            recent = "".join(collected[-40:])
+            before = "".join(collected[-80:-40])
+            if recent == before:
+                print("\n⚠️  Зацикливание — генерация остановлена")
+                break
 
     # Если модель ответила без think-блока — вывести всё
     if not answer_started:
@@ -337,7 +343,7 @@ def ask_pattern(name: str, question: str, grow: bool = True) -> str:
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
 
-        print(f"💾 Паттерн обновлён: +{len(q_tokens)} токенов  ({meta['size_kb']} KB, диалогов: {meta['n_asks']})")
+        print(f"💾 {name}  ({meta['size_kb']} KB, {meta['n_asks']}д)")
 
     # Авто-детекция предложения expand от модели
     response = "".join(collected)
@@ -357,7 +363,8 @@ def _peek_pattern(name: str, prompt: str) -> str | None:
         with open(pkl, "rb") as f:
             state = pickle.load(f)
         llm.load_state(state)
-        q_tokens = llm.tokenize(_question_prompt(prompt).encode("utf-8"), add_bos=False)
+        # /no_think подавляет расширенный reasoning Qwen3 (экономит токены)
+        q_tokens = llm.tokenize(_question_prompt(prompt + "\n/no_think").encode("utf-8"), add_bos=False)
         collected = []
         for token_id in llm.generate(q_tokens, reset=False, temp=0.1, top_p=0.9):
             piece = llm.detokenize([token_id]).decode("utf-8", errors="replace")
@@ -365,7 +372,7 @@ def _peek_pattern(name: str, prompt: str) -> str | None:
             full = "".join(collected)
             if any(stop in full[-60:] for stop in STOP_TOKENS):
                 break
-            if len(collected) >= 120:
+            if len(collected) >= 400:  # 120 → 400: think-блок один съедает ~200 токенов
                 break
         response = "".join(collected)
         # Qwen3 оборачивает reasoning в <think>...</think> — берём только ответ
@@ -429,14 +436,8 @@ def _maybe_expand(pattern_name: str, question: str, response: str) -> dict | Non
     else:
         suggested_task = question
 
-    try:
-        ans = input(f"\n🔄 Запустить expand? [{suggested_task[:60]}] [Y/n] ").strip().lower()
-    except (KeyboardInterrupt, EOFError):
-        return None
-
-    if ans != "n":
-        return _handoff_to_rwkv(pattern_name, suggested_task)
-    return None
+    print(f"\n🔄 Expand → RWKV: «{suggested_task[:70]}»")
+    return _handoff_to_rwkv(pattern_name, suggested_task, original_question=question)
 
 
 def _maybe_route_suggestion(question: str, response: str) -> dict | None:
@@ -456,14 +457,9 @@ def _maybe_route_suggestion(question: str, response: str) -> dict | None:
     m = re.search(r'route\s+([^\n`<]{5,150})', response, re.IGNORECASE)
     suggested_task = m.group(1).strip().rstrip('.,!?`').strip() if m else question
 
-    try:
-        ans = input(f"\n🗺  Запустить route? [{suggested_task[:60]}] [Y/n] ").strip().lower()
-    except (KeyboardInterrupt, EOFError):
-        return None
-
-    if ans != "n":
-        return {"action": "expand_route", "task": suggested_task, "index": index}
-    return None
+    print(f"\n🗺  Route → RWKV: «{suggested_task[:70]}»")
+    return {"action": "expand_route", "task": suggested_task, "index": index,
+            "original_question": question}
 
 
 def _maybe_chain_handoff(active: str, question: str, response: str) -> dict | None:
@@ -571,6 +567,12 @@ def _chain_ask(base_pattern: str, extra_text: str, question: str) -> str:
             break
         if len(collected) >= MAX_TOKENS:
             break
+        if len(collected) >= 80:
+            recent = "".join(collected[-40:])
+            before = "".join(collected[-80:-40])
+            if recent == before:
+                print("\n⚠️  Зацикливание — генерация остановлена")
+                break
 
     if not answer_started:
         print("".join(collected), end="", flush=True)
@@ -579,6 +581,54 @@ def _chain_ask(base_pattern: str, extra_text: str, question: str) -> str:
     print("   🔗 Цепочка завершена — паттерн не изменён")
 
     return "".join(collected)
+
+
+def _do_edit(file_path: str, task: str, base_pattern: str | None = None) -> str:
+    """
+    Читает файл СВЕЖО и просит модель выдать unified diff.
+
+    Разница с /load + ask:
+      - Файл читается прямо сейчас (не из KV-cache) → точные строки, точные номера
+      - base_pattern загружается как фон (проектный контекст, агент)
+      - Если base_pattern не задан — временный паттерн из самого файла
+
+    Возвращает ответ модели (ожидается unified diff) или "" при ошибке.
+    """
+    p = Path(file_path)
+    if not p.exists():
+        print(f"❌ Файл не найден: {file_path}")
+        return ""
+
+    content = p.read_text(encoding="utf-8", errors="ignore")
+    n_lines = len(content.splitlines())
+    print(f"\n📄 Читаю файл: {p.resolve()}  ({n_lines} строк, {len(content)} символов)")
+
+    file_block = (
+        f"# Файл для редактирования: {p.resolve()}\n\n"
+        f"```\n{content}\n```"
+    )
+    edit_question = (
+        f"{task}\n\n"
+        "Выдай unified diff для этого изменения. Используй точные номера строк из файла.\n"
+        "Формат:\n"
+        "--- a/имя_файла\n"
+        "+++ b/имя_файла\n"
+        "@@ -N,M +N,M @@\n"
+        " контекстная строка\n"
+        "-удалённая строка\n"
+        "+добавленная строка\n"
+        "Только diff, без объяснений."
+    )
+
+    if base_pattern and core.pattern_exists(PATTERNS_DIR, base_pattern):
+        # Инжектируем содержимое файла поверх KV-cache паттерна
+        return _chain_ask(base_pattern, file_block, edit_question)
+    else:
+        # Нет активного паттерна — временный из самого файла (не сохраняется)
+        _EDIT_TMP = "_edit_tmp"
+        _load_path(_EDIT_TMP, file_path)
+        resp, _ = ask_pattern(_EDIT_TMP, edit_question, grow=False)
+        return resp or ""
 
 
 # =============================================================================
@@ -594,6 +644,7 @@ HELP = """
   /load <имя> @<файл>        — загрузить файл как паттерн
   /load <имя> @<д1> @<д2>   — composite: несколько папок в одном eval-проходе
   /load <имя> <текст>        — загрузить текст как паттерн
+  /edit @<файл> <задача> — читает файл свежо → точный unified diff → /patch
   /patch               — применить unified diff из последнего ответа к файлу
   /patch @<файл>       — применить к конкретному файлу (override)
   /agents              — список доступных агентов
@@ -614,6 +665,7 @@ HELP = """
   исправь JWT                         ← просишь исправление
   /agent style arch                   ← включить ambient: стиль + архитектура одновременно
   /review @src/auth.py                ← ревью файла (стиль + код)
+  /edit @src/auth.py исправь JWT      ← читает файл свежо → точный diff
   /patch                              ← применяем diff к auth.py
   expand нужен контекст по auth       ← передать задачу в RWKV (обзор)
   route добавить rate limiting        ← найти нужные файлы через RWKV-индекс
@@ -633,15 +685,15 @@ def _load_path(name: str, raw_path: str, force_policy: str = None):
         texts.append(header)
         for f in files:
             try:
-                texts.append(f"# {f.relative_to(p)}\n\n{f.read_text(encoding='utf-8', errors='ignore')}")
-                paths.append(str(f))
+                texts.append(f"# {f.resolve()}\n\n{f.read_text(encoding='utf-8', errors='ignore')}")
+                paths.append(str(f.resolve()))
             except Exception:
                 pass
         print(f"   Загружаю {len(files)} файлов из {raw_path}/  (git ls-files / rglob)")
         save_pattern(name, "\n\n---\n\n".join(texts), source_files=paths, grow_policy=force_policy)
     elif p.is_file():
         save_pattern(name, p.read_text(encoding="utf-8", errors="ignore"),
-                     source_files=[str(p)], grow_policy=force_policy)
+                     source_files=[str(p.resolve())], grow_policy=force_policy)
     else:
         print(f"❌ Не найден файл или папка: {raw_path}")
 
@@ -662,9 +714,9 @@ def _load_mix(name: str, raw_paths: list[str], force_policy: str = None):
             for f in files:
                 try:
                     block_texts.append(
-                        f"# {f.relative_to(p)}\n\n{f.read_text(encoding='utf-8', errors='ignore')}"
+                        f"# {f.resolve()}\n\n{f.read_text(encoding='utf-8', errors='ignore')}"
                     )
-                    all_sources.append(str(f))
+                    all_sources.append(str(f.resolve()))
                 except Exception:
                     pass
             all_texts.append("\n\n---\n\n".join(block_texts))
@@ -814,17 +866,18 @@ def _find_rwkv_index() -> str | None:
     return None
 
 
-def _handoff_to_rwkv(active: str, task: str) -> dict:
+def _handoff_to_rwkv(active: str, task: str, original_question: str = "") -> dict:
     """Передаёт задачу в RWKV. Возвращает dict для in-process switch через оркестратор."""
     meta = core.read_meta(PATTERNS_DIR, active) if active else {}
     sources = [s["path"] for s in meta.get("source_files", [])]
     core.save_expand_request(PATTERNS_DIR, task, active or "", sources)
     return {
-        "action":       "expand",
-        "task":         task,
-        "from_pattern": active or "",
-        "from_sources": sources,
-        "requested_at": datetime.now().isoformat(),
+        "action":            "expand",
+        "task":              task,
+        "original_question": original_question,
+        "from_pattern":      active or "",
+        "from_sources":      sources,
+        "requested_at":      datetime.now().isoformat(),
     }
 
 
@@ -834,11 +887,7 @@ def cli_loop(auto_route: bool = False, pending: dict = None) -> dict | None:
     Возвращает dict handoff (action=expand) или None при /exit.
     При запуске через когнит.py — используется pending для авто-маршрута.
     """
-    print(f"""
-╔══════════════════════════════════════════════╗
-║  🧠 Cognit · Transformer ({MODEL_NAME[:16]})
-║  KV-cache · {REPO_NAME}/{BRANCH_NAME}
-╚══════════════════════════════════════════════╝""")
+    print(f"\n🧠 Transformer · {MODEL_NAME[:28]} · {REPO_NAME}/{BRANCH_NAME}")
 
     list_patterns()
     _auto_init_agents()
@@ -878,6 +927,24 @@ def cli_loop(auto_route: bool = False, pending: dict = None) -> dict | None:
                 active = last_loaded  # сразу активируем последний загруженный
                 active_policy = (core.read_meta(PATTERNS_DIR, active) or {}).get("grow_policy", "retrain")
                 print(f"\n✅ Готов. Активный паттерн: {active}")
+
+                # Zero-touch: авто-задаём исходный вопрос пользователя
+                orig_q = route.get("original_question", "")
+                if orig_q and route.get("auto"):
+                    print(f"\n🎯 Авто-вопрос: «{orig_q}»")
+                    valid_files = [f for f in route.get("files", []) if os.path.exists(f)]
+                    if len(valid_files) == 1:
+                        # Один файл → читаем свежо, точный diff
+                        last_response = _do_edit(valid_files[0], orig_q, active)
+                        if last_response:
+                            print("\n💡 Применить? → /patch")
+                    else:
+                        # Несколько файлов → ask через KV-cache
+                        last_response, handoff = ask_pattern(
+                            active, orig_q, grow=(active_policy == "grow")
+                        )
+                        if handoff:
+                            return handoff
 
     if not active:
         print("\nВыбери паттерн командой 'use <имя>' или '/help' для справки.")
@@ -933,6 +1000,19 @@ def cli_loop(auto_route: bool = False, pending: dict = None) -> dict | None:
                     active = name  # автоматически переключаемся на новый паттерн
                     active_policy = (core.read_meta(PATTERNS_DIR, active) or {}).get("grow_policy", "retrain")
                     print(f"   Активный паттерн: {active}")
+
+                elif cmd == "edit":
+                    # /edit @src/config.py поменяй 0-1 на проценты
+                    if len(parts) < 3 or not parts[1].startswith("@"):
+                        print("❌ Использование: /edit @<файл> <задача>")
+                        print("   Пример: /edit @src/config.py поменяй 0-1 на проценты")
+                        continue
+                    edit_path = parts[1][1:]
+                    edit_task = parts[2]
+                    result = _do_edit(edit_path, edit_task, active)
+                    if result:
+                        last_response = result
+                        print("\n💡 Применить? → /patch")
 
                 elif cmd == "patch":
                     if not active:
