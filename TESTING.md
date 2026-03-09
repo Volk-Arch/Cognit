@@ -57,14 +57,14 @@ https://huggingface.co/Qwen/Qwen3-8B-GGUF
 ```
 Положить в `models/Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf`
 
-**RWKV (~4.1 GB VRAM, опционально — нужен для route/expand):**
+**RWKV (~4.1 GB VRAM, опционально — нужен для пайплайна):**
 Скачать `RWKV-6-World-7B-Q4_K_M.gguf` с HuggingFace:
 ```
 https://huggingface.co/bartowski/RWKV-x060-World-7B-v2.1-GGUF
 ```
 Положить в `models/rwkv/RWKV-6-World-7B-Q4_K_M.gguf`
 
-> Для теста только Transformer достаточно.
+> Для базового теста только Transformer достаточно.
 
 ---
 
@@ -120,6 +120,12 @@ cat /path/to/my-project/agents/style/global.md
 # Должен быть реальный Python style guide, не заглушки
 ```
 
+**Проверка — pipeline.json создан:**
+```bash
+cat /path/to/my-project/pipeline.json
+```
+Должно быть 5 стадий: navigator, context, arch, style, coder.
+
 ---
 
 ## Шаг 6 — Smoke: первый запуск
@@ -140,13 +146,10 @@ Cognit · Transformer (Qwen3-8B-Q4_K_M) | GPU | слои: -1 | ctx: 8192
    Загружаю агента: context  (...)
    🃏 Генерирую card.md для context... ✓
 
-   🎯 Создаю оркестратор из 3 card.md...
-
-📋 Паттернов: 4
+📋 Паттернов: 3
   • style  [T]  2026-03-09
   • arch   [T]  2026-03-09
   • context [T] 2026-03-09
-  • orchestrator [T] 2026-03-09
 
 🧠>
 ```
@@ -154,13 +157,12 @@ Cognit · Transformer (Qwen3-8B-Q4_K_M) | GPU | слои: -1 | ctx: 8192
 **Что проверяем:**
 - Модель загрузилась без ошибок (однострочный баннер без рамки)
 - Агенты инициализировались автоматически (паттернов не было — создались)
-- card.md сгенерированы для каждого агента
-- Оркестратор создан из card.md
+- `card.md` сгенерированы для каждого агента в `agents/*/card.md`
 - `/list` — компактный формат, одна строка на паттерн
 
 ---
 
-## Шаг 7 — Загружаем файл и задаём вопрос
+## Шаг 7 — Загружаем файл и задаём вопрос (ручной режим)
 
 ```
 🧠> /load main @src/main.py
@@ -168,7 +170,7 @@ Cognit · Transformer (Qwen3-8B-Q4_K_M) | GPU | слои: -1 | ctx: 8192
 ```
 
 **Что проверяем:**
-- Паттерн создался: появилось `echo_patterns/<repo>/main/main.pkl`
+- Паттерн создался: `echo_patterns/<repo>/main/main.pkl`
 - Модель ответила на вопрос о `hello()`
 - Промпт переключился на `🧠 [main]>`
 
@@ -193,7 +195,7 @@ Cognit · Transformer (Qwen3-8B-Q4_K_M) | GPU | слои: -1 | ctx: 8192
 
 ---
 
-## Шаг 9 — Авто-выбор агентов
+## Шаг 9 — Авто-выбор агентов (keyword)
 
 Спрашиваем что-то про стиль:
 ```
@@ -202,15 +204,11 @@ Cognit · Transformer (Qwen3-8B-Q4_K_M) | GPU | слои: -1 | ctx: 8192
 
 Ожидаем:
 ```
-   🎯 Оркестратор... style
 🤖 Авто-агенты: style
 [модель отвечает с учётом style-агента]
 ```
 
-Если оркестратора нет — должно быть keyword-fallback:
-```
-🤖 Авто-агенты: style
-```
+Keyword-matching по словам: `стиль`, `style`, `именован`, `назван`, `конвенц` — подключает style-агента.
 
 ---
 
@@ -221,7 +219,12 @@ Cognit · Transformer (Qwen3-8B-Q4_K_M) | GPU | слои: -1 | ctx: 8192
 🧠 [main~]> переименуй функцию hello в greet и добавь параметр name: str
 ```
 
-Если в ответе есть diff-блок — сразу пробуем:
+Если в ответе есть diff-блок — появится подсказка:
+```
+💡 Есть код в ответе → /patch
+```
+
+Пробуем:
 ```
 🧠 [main~]> /patch
 ```
@@ -250,7 +253,32 @@ cat /path/to/my-project/src/main.py.cognit.bak
 
 ---
 
-## Шаг 10б — /edit: точная правка файла
+## Шаг 10б — /patch для нового файла
+
+Просим создать новый файл:
+```
+🧠 [main~]> создай src/utils.py с функцией format_name(name: str) -> str
+```
+
+Ожидаем diff с `--- /dev/null`:
+```diff
+--- /dev/null
++++ b/src/utils.py
+@@ -0,0 +1,5 @@
++def format_name(name: str) -> str:
++    ...
+```
+
+```
+🧠 [main~]> /patch
+НОВЫЙ ФАЙЛ: src/utils.py
+Создать? [y/N]: y
+✅ Файл создан → src/utils.py
+```
+
+---
+
+## Шаг 10в — /edit: точная правка файла
 
 `/edit` читает файл заново (не из KV-cache паттерна) и сразу просит diff:
 
@@ -338,7 +366,7 @@ python cognit.py
 
 Паттерны уже есть — загрузка быстрая:
 ```
-📋 Паттернов: 4  (style, arch, context, orchestrator)
+📋 Паттернов: 3  (style, arch, context)
 🧠> use main
 🧠 [main~]> продолжим — что ещё исправить?
 ```
@@ -347,122 +375,80 @@ python cognit.py
 
 ---
 
-## Шаг 15 — route + expand (если есть RWKV)
+## Шаг 15 — Пайплайн (если есть RWKV)
 
-Тест zero-touch маршрутизации. RWKV запускается headless — пользователь его не видит.
+Тест автоматического пайплайна. RWKV запускается headless — пользователь его не видит.
 
-### Сценарий A: индекса нет — expand строит его автоматически
+### Сценарий A: задача описана текстом — пайплайн запускается сам
 
 ```bash
 python cognit.py
-🧠> expand добавить логирование в main
+🧠> поправить функцию hello — сделать более расширенной
 ```
 
 Ожидаем:
 ```
-⚙️  RWKV: индексирую и маршрутизирую...
-   🔄 Индексирую проект: /path/to/my-project
-   (первый запуск займёт несколько минут — потом мгновенно)
-   🎯 Ищу файлы для: «добавить логирование в main»
-→ Файлы: src/main.py
+⚙️  RWKV: навигирую...
+   → Файлы: src/main.py
+   → Мемо: hello() в main.py строки 1-3, нет зависимостей
 
-[Transformer загружает src/main.py и сразу отвечает на вопрос]
-🧠 [main]>
+🚀 Пайплайн (5 стадий)
+  ✓ [rwkv  ] navigator
+  ✓ [agent ] context
+  ✓ [agent ] arch
+  ✓ [agent ] style
+  ✓ [coder ] coder
+  💡 Diff готов → /patch
+
+🧠 [_pipeline]>
 ```
 
-### Сценарий B: индекс уже есть — route мгновенно
+```
+🧠 [_pipeline]> /patch
+✅ Патч применён → src/main.py
+```
+
+**Что проверяем:**
+- RWKV запустился headless и завершился до отображения пайплайна
+- Каждая стадия отмечена `✓`
+- `_pipeline` паттерн — временный (retrain, будет сброшен при следующем пайплайне)
+
+### Сценарий B: создать новый файл через пайплайн
 
 ```bash
 python cognit.py
-🧠> route добавить логирование в main
+🧠> создать новый файл src/validators.py с функцией validate_email
 ```
 
-Ожидаем:
+Ожидаем пайплайн, в конце diff с `--- /dev/null`, затем:
 ```
-⚙️  RWKV: маршрутизирую...
-→ Файлы: src/main.py
-[Transformer загружает файлы и отвечает]
-🧠 [main]>
-```
-
-### Сценарий C: индекс вручную (--rwkv)
-
-Если нужно явно переиндексировать проект:
-```bash
-python cognit.py --rwkv
-🧠> /load repo @src/
-🧠> /exit
+🧠 [_pipeline]> /patch
+НОВЫЙ ФАЙЛ: src/validators.py
+Создать? [y/N]: y
+✅ Файл создан → src/validators.py
 ```
 
-После этого `route`/`expand` из Transformer будут использовать этот индекс мгновенно.
+### Сценарий C: pipeline.json — отключить стадию
 
----
-
-## Типичные сценарии (краткая справка)
-
-### Сценарий A: знаешь файл → сразу Transformer
-
-```
-python cognit.py
-
-🧠> /load auth @src/auth/middleware.py
-🧠 [auth]> есть ли уязвимости в JWT-проверке?
-🧠 [auth]> исправь алгоритм
-🧠 [auth]> /patch
+Редактируем `/path/to/my-project/pipeline.json`:
+```json
+{
+  "stages": [
+    {"id": "navigator", "type": "rwkv",  "enabled": true},
+    {"id": "context",   "type": "agent", "name": "context", "enabled": false},
+    {"id": "arch",      "type": "agent", "name": "arch",    "enabled": true},
+    {"id": "style",     "type": "agent", "name": "style",   "enabled": true},
+    {"id": "coder",     "type": "coder",                    "enabled": true}
+  ]
+}
 ```
 
-`/patch` — если в ответе нет diff-блока, автоматически запрашивает его у модели, показывает изменения и применяет с `.cognit.bak`.
-
-Для точной правки конкретного места:
+Запускаем задачу:
 ```
-🧠 [auth]> /edit @src/auth/middleware.py убрать хардкод алгоритма RS256
-💡 Применить? → /patch
+🧠> поправить что-нибудь
 ```
 
-### Сценарий B: не знаешь файл → route (RWKV headless)
-
-```
-python cognit.py
-
-🧠> route добавить rate limiting для POST /login
-⚙️  RWKV: маршрутизирую...
-
-→ Файлы: middleware.py, routes.py, db/connection.py
-
-🧠 [middleware]> как сейчас реализовано ограничение запросов?
-```
-
-RWKV запустился и завершился незаметно. Индекс создаётся автоматически при первом `route`/`expand` если его нет.
-
-### Сценарий C: нужен широкий контекст → expand
-
-```
-python cognit.py
-
-🧠> /load auth @src/auth/middleware.py
-🧠 [auth]> как это соотносится с остальной авторизацией?
-🧠 [auth]> expand нужен контекст по всей авторизации
-⚙️  RWKV: индексирую и маршрутизирую...
-
-→ Файлы: middleware.py, auth_service.py, db/users.py
-
-🧠 [auth]> расскажи об архитектуре авторизации в проекте
-```
-
-### Сценарий D: персистентность между сессиями
-
-```bash
-# Завершили сессию, перезапустили
-python cognit.py
-📋 Паттернов: 3
-  • auth~  [T]  2026-03-09  12д
-  • style  [T]  2026-03-09
-  • arch   [T]  2026-03-09
-🧠> use auth
-🧠 [auth~]> продолжим — что ещё проверить?
-```
-
-Файл не перечитывается — только вопрос. Контекст накоплен с прошлой сессии.
+В выводе пайплайна: `context` помечен `✗`, остальные `✓`.
 
 ---
 
@@ -472,13 +458,15 @@ python cognit.py
 |---|---|
 | Smoke | Однострочный баннер, модель загрузилась без ошибок |
 | card.md | Файлы `agents/*/card.md` созданы после первого запуска |
-| Оркестратор | `echo_patterns/.../orchestrator.pkl` существует |
+| pipeline.json | Файл создан в клиентском проекте при `cognit_setup.py` |
 | grow ~ | `/list` — компактный формат, `~` для feature-паттернов |
-| /patch | `main.py` изменён, `.cognit.bak` создан |
+| /patch (правка) | `main.py` изменён, `.cognit.bak` создан |
+| /patch (новый файл) | `utils.py` создан, `.bak` не создаётся |
 | /edit | Файл читается свежим, diff генерируется без обращения к KV-cache |
 | /agent | Промпт меняется, `/agent off` возвращает обычный |
-| route headless | `route <задача>` → RWKV запускается/завершается без CLI → Transformer отвечает |
-| expand headless | `expand <задача>` → RWKV строит индекс + маршрутизирует headless |
+| Keyword agents | Вопрос про стиль → `🤖 Авто-агенты: style` без оркестратора |
+| Пайплайн headless | RWKV запускается/завершается без CLI → Transformer запускает стадии |
+| pipeline.json disable | Отключённая стадия → `✗` в выводе, пропускается |
 | Повторный запуск | Вопрос без перезагрузки файла работает |
 | post-commit хук | Grow-паттерн пропускается, retrain — пересоздаётся |
-| Сброс и переиндексация | Удалить `echo_patterns/` → `cognit_setup.py` → первый `route` пересоздаёт индекс |
+| Сброс | Удалить `echo_patterns/` → первый пайплайн пересоздаёт всё |

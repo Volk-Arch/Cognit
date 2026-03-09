@@ -373,103 +373,121 @@ def _maybe_route(pattern_name: str, question: str, response: str) -> dict | None
 def route_pattern(index_name: str, task: str) -> dict | None:
     """
     Использует RWKV-индекс для определения файлов, релевантных задаче.
-    Возвращает handoff dict или None если файлы не определены.
+    Стратегия: читаем реальный список файлов из метаданных,
+    даём RWKV нумерованный список и просим выбрать номера — не придумывать пути.
     """
+    import re as _re
+
     print(f"\n🗺  Маршрутизация задачи через индекс '{index_name}'...")
     _check_and_refresh(index_name)
     if not load_pattern(index_name):
         return
 
+    # Читаем реальный список файлов из метаданных индекса
+    meta = core.read_meta(PATTERNS_DIR, index_name) or {}
+    known_files = [
+        sf["path"] for sf in meta.get("source_files", [])
+        if os.path.exists(sf["path"])
+    ]
+
+    if not known_files:
+        print("❌ Нет файлов в метаданных индекса. Пересоздай: /load repo @<путь>")
+        return None
+
+    # Нумерованный список — RWKV выбирает номера и объясняет связи
+    file_lines = "\n".join(
+        f"{i+1}. {Path(fp).name}  [{fp}]"
+        for i, fp in enumerate(known_files)
+    )
+    # RWKV-навигатор: выбирает файлы И пишет мемо о связях/где смотреть
+    # Примируем "Файлы:" — модель продолжает строку числами, не создаёт список
+    task_short = task[:120]
     route_prompt = (
-        f"User: Задача: {task}\n"
-        "Перечисли ТОЛЬКО пути к файлам, которые нужно изучить для этой задачи. "
-        "Один путь на строку. Никакого другого текста.\n\n"
-        "Assistant:"
+        f"User: Список файлов проекта:\n{file_lines}\n\n"
+        f"Задача: {task_short}\n\n"
+        "Формат ответа (строго две строки):\n"
+        "Файлы: <номера через запятую>\n"
+        "Мемо: <какие функции/классы затронуты, зависимости, на что обратить внимание — 2-3 предложения>\n\n"
+        "Пример:\n"
+        "Файлы: 1\n"
+        "Мемо: bayes_update() в main.py строки 42-67. Вызывает validate_input() строка 12. "
+        "Входные параметры float в диапазоне [0,1].\n\n"
+        "Assistant: Файлы:"
     )
     r_tokens = llm.tokenize(route_prompt.encode("utf-8"), add_bos=False)
-
-    print(f"   Токенов запроса: {len(r_tokens)}")
+    print(f"   Файлов в индексе: {len(known_files)}  |  Токенов запроса: {len(r_tokens)}")
     print("─" * 50)
 
     collected = []
-    # Температура 0.2 — детерминированный вывод для списка файлов
-    for token_id in llm.generate(r_tokens, reset=False, temp=0.2, top_p=0.9, repeat_penalty=1.3):
+    for token_id in llm.generate(r_tokens, reset=False, temp=0.0, top_p=0.9, repeat_penalty=1.0):
         piece = llm.detokenize([token_id]).decode("utf-8", errors="replace")
         collected.append(piece)
         full = "".join(collected)
-
-        clean = piece
-        for stop in STOP_SEQS:
-            if stop in clean:
-                clean = clean[:clean.index(stop)]
-        print(clean, end="", flush=True)
+        print(piece, end="", flush=True)
 
         tail = full[-60:]
         if any(stop in tail for stop in STOP_SEQS):
             break
-        if len(collected) >= 200:
+        # Мемо может быть 2-3 предложения — даём до 160 токенов
+        if len(collected) >= 160:
             break
-        if len(collected) >= 80:
-            recent = "".join(collected[-40:])
-            before = "".join(collected[-80:-40])
-            if recent == before:
-                break
+        # Ранний stop: строка Мемо заполнена и закончилась переносом строки
+        if "Мемо:" in full and full.rstrip('\n').endswith('.'):
+            break
 
     print("\n" + "─" * 50)
 
-    # Парсим пути из ответа
     raw = "".join(collected)
     for stop in STOP_SEQS:
         if stop in raw:
             raw = raw[:raw.index(stop)]
 
-    files = []
-    for line in raw.strip().splitlines():
-        line = line.strip().lstrip("•-*123456789. ")
-        # Принимаем строки, похожие на пути к файлам
-        if line and len(line) > 2 and not line.startswith("#"):
-            if "/" in line or "\\" in line or (
-                "." in line and " " not in line and not line.startswith(".")
-            ):
-                files.append(line)
+    # Промпт заканчивался на "Файлы:" — восстанавливаем для парсинга
+    raw = "Файлы:" + raw
 
-    if not files:
-        print("⚠️  Не удалось распознать пути в ответе.")
-        print("   Попробуйте переформулировать задачу или уточнить индекс.")
-        return None
+    # Парсим "Файлы: 1, 2" → числа; "Мемо: ..." → context_note для пайплайна
+    files_line = ""
+    note_lines = []
+    for line in raw.splitlines():
+        ls = line.strip()
+        if ls.lower().startswith("файлы:"):
+            files_line = ls[len("файлы:"):].strip()
+        elif ls.lower().startswith("мемо:"):
+            note_lines.append(ls[len("мемо:"):].strip())
+        elif note_lines and ls and not ls.lower().startswith("файлы:"):
+            # Мемо может быть многострочным (продолжение)
+            note_lines.append(ls)
+    note_line = " ".join(note_lines).strip()
 
-    # Дедупликация и проверка существования путей
-    seen = set()
-    valid_files, ghost_files = [], []
-    for fpath in files:
-        if fpath in seen:
-            continue
-        seen.add(fpath)
-        if os.path.exists(fpath):
-            valid_files.append(fpath)
-        else:
-            ghost_files.append(fpath)
+    numbers = [int(n) for n in _re.findall(r'\d+', files_line) if 1 <= int(n) <= len(known_files)]
+    # Fallback: если структуры нет — ищем числа в первой строке
+    if not numbers:
+        first_line = raw.split('\n')[0]
+        numbers = [int(n) for n in _re.findall(r'\d+', first_line) if 1 <= int(n) <= len(known_files)]
+    if not numbers:
+        all_nums = [int(n) for n in _re.findall(r'\d+', raw) if 1 <= int(n) <= len(known_files)]
+        numbers = all_nums[:3]
 
-    if ghost_files:
-        print(f"\n⚠️  {len(ghost_files)} путей не существует (модель угадала пути):")
-        for f in ghost_files:
-            print(f"   ✗ {f}")
+    if not numbers:
+        print("⚠️  Не удалось определить файлы — возвращаю весь индекс.")
+        valid_files = known_files
+    else:
+        seen = set()
+        valid_files = []
+        for n in numbers:
+            fp = known_files[n - 1]
+            if fp not in seen:
+                seen.add(fp)
+                valid_files.append(fp)
 
-    if not valid_files:
-        print("❌ Ни один файл не найден. RWKV-индекс устарел или проект не проиндексирован.")
-        print("   Пересоздай индекс: /load repo @<путь к проекту>")
-        return None
+    print(f"\n→ Файлов: {len(valid_files)}")
+    for fp in valid_files:
+        print(f"  {fp}")
+    if note_line:
+        print(f"  💡 {note_line}")
 
-    files = valid_files
-    print(f"\n📂 Найдено файлов: {len(files)}")
-    print("\n   Команды для Transformer:")
-    for fpath in files:
-        stem = Path(fpath).stem.replace("-", "_").replace(".", "_")
-        print(f"   /load {stem} @{fpath}")
-
-    route_path = core.save_route(PATTERNS_DIR, index_name, task, files)
-    print(f"\n💾 Маршрут сохранён: {route_path}")
-    return _handoff_to_transformer(index_name, task, files)
+    route_path = core.save_route(PATTERNS_DIR, index_name, task, valid_files)
+    return _handoff_to_transformer(index_name, task, valid_files, context_note=note_line)
 
 
 def list_patterns():
@@ -508,7 +526,8 @@ def _load_path(name: str, raw_path: str, force_policy: str = None):
     """Загружает файл или директорию как паттерн."""
     p = Path(raw_path)
     if p.is_dir():
-        files = core.collect_text_files(p)
+        # agents/ — метаданные Cognit, не исходный код проекта
+        files = core.collect_text_files(p, exclude_dirs={"agents"})
         if not files:
             print(f"❌ Папка пуста или нет подходящих файлов: {raw_path}")
             return
@@ -536,7 +555,8 @@ def _hint_patterns():
 
 
 def _handoff_to_transformer(index_name: str, task: str, files: list[str],
-                            original_question: str = "", auto: bool = False) -> dict:
+                            original_question: str = "", auto: bool = False,
+                            context_note: str = "") -> dict:
     """Передаёт задачу Transformer. Возвращает dict для in-process switch."""
     return {
         "action":            "route",
@@ -546,6 +566,7 @@ def _handoff_to_transformer(index_name: str, task: str, files: list[str],
         "routed_at":         datetime.now().isoformat(),
         "original_question": original_question,
         "auto":              auto,
+        "context_note":      context_note,
     }
 
 

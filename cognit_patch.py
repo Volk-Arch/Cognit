@@ -34,6 +34,11 @@ def _diff_target(diff: str) -> str | None:
     return None
 
 
+def _is_new_file_diff(diff: str) -> bool:
+    """Возвращает True если diff создаёт новый файл (--- /dev/null)."""
+    return bool(re.search(r'^---[ \t]+/dev/null', diff, re.MULTILINE))
+
+
 def _apply_unified_diff(diff_text: str, orig_lines: list[str]) -> list[str]:
     """Чистая Python-реализация применения unified diff."""
     result = []
@@ -80,12 +85,19 @@ def _apply_unified_diff(diff_text: str, orig_lines: list[str]) -> list[str]:
 
 
 def apply_patch(diff: str, file_path: str) -> bool:
-    """Применяет unified diff к файлу. Создаёт .cognit.bak перед изменением."""
-    try:
-        orig = Path(file_path).read_text(encoding='utf-8')
-    except Exception as e:
-        print(f"❌ Не могу прочитать файл: {e}")
-        return False
+    """Применяет unified diff к файлу. Создаёт .cognit.bak перед изменением.
+    Поддерживает создание новых файлов (--- /dev/null)."""
+    p = Path(file_path)
+    is_new = _is_new_file_diff(diff) or not p.exists()
+
+    if is_new:
+        orig = ""
+    else:
+        try:
+            orig = p.read_text(encoding='utf-8')
+        except Exception as e:
+            print(f"❌ Не могу прочитать файл: {e}")
+            return False
 
     try:
         new_lines = _apply_unified_diff(diff, orig.splitlines(keepends=True))
@@ -93,12 +105,19 @@ def apply_patch(diff: str, file_path: str) -> bool:
         print(f"❌ Ошибка применения патча: {e}")
         return False
 
+    # Создаём папки если нужно
+    p.parent.mkdir(parents=True, exist_ok=True)
+
     bak = file_path + ".cognit.bak"
-    Path(bak).write_text(orig, encoding='utf-8')
+    if not is_new:
+        Path(bak).write_text(orig, encoding='utf-8')
     try:
-        Path(file_path).write_text(''.join(new_lines), encoding='utf-8')
-        print(f"✅ Патч применён → {file_path}")
-        print(f"   Бэкап: {bak}")
+        p.write_text(''.join(new_lines), encoding='utf-8')
+        if is_new:
+            print(f"✅ Файл создан → {file_path}")
+        else:
+            print(f"✅ Патч применён → {file_path}")
+            print(f"   Бэкап: {bak}")
         return True
     except Exception as e:
         print(f"❌ Не могу записать файл: {e}")

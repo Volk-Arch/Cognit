@@ -351,6 +351,218 @@ def ask_pattern(name: str, question: str, grow: bool = True) -> str:
     return response, handoff  # tuple[str, dict | None]
 
 
+def _save_current_kv(name: str):
+    """Сохраняет текущий KV-cache llm в паттерн без дополнительного eval.
+    Используется после _chain_ask чтобы follow-up вопросы имели полный контекст."""
+    state = llm.save_state()
+    pattern_path = Path(PATTERNS_DIR) / f"{name}.pkl"
+    meta_path    = Path(PATTERNS_DIR) / f"{name}.json"
+    with open(pattern_path, "wb") as f:
+        pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+    if meta_path.exists():
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        meta["n_tokens"]   = llm.n_tokens
+        meta["size_kb"]    = round(pattern_path.stat().st_size / 1024, 1)
+        meta["updated_at"] = datetime.now().isoformat()
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+
+
+def _extract_line_range(memo: str, filename: str) -> tuple[int, int] | None:
+    """
+    Парсит диапазон строк из RWKV мемо для конкретного файла.
+    Ищет паттерны: 'строки 42-67', 'lines 42-67', ':42-67'.
+    Сначала ищет вблизи имени файла, потом по всему мемо.
+    """
+    patterns = [
+        r'стр(?:оки?)?\s+(\d+)\s*[-–—]\s*(\d+)',   # строки 42-67, стр. 42-67
+        r'lines?\s+(\d+)\s*[-–—]\s*(\d+)',          # lines 42-67, line 42-67
+        r':(\d+)\s*[-–—]\s*(\d+)',                  # :42-67
+    ]
+    stem = Path(filename).stem.lower()
+    fname_pos = memo.lower().find(stem)
+    zones = []
+    if fname_pos >= 0:
+        zones.append(memo[max(0, fname_pos - 10): fname_pos + 200])
+    zones.append(memo)
+
+    for zone in zones:
+        for pat in patterns:
+            m = re.search(pat, zone, re.IGNORECASE)
+            if m:
+                return int(m.group(1)), int(m.group(2))
+    return None
+
+
+def _focused_file_content(filepath: str, memo: str, context_lines: int = 15) -> str:
+    """
+    Возвращает сфокусированный фрагмент файла если в RWKV мемо есть номера строк.
+    Фрагмент = указанные строки ± context_lines, с номерами строк.
+    Если номеров нет — полный файл до FILE_LIMIT символов.
+    """
+    FILE_LIMIT = 8000
+    try:
+        raw = Path(filepath).read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+    lines = raw.splitlines()
+    rng   = _extract_line_range(memo, Path(filepath).name)
+
+    if rng:
+        start_line, end_line = rng
+        start_idx = max(0, start_line - 1 - context_lines)   # 0-indexed
+        end_idx   = min(len(lines), end_line + context_lines)
+
+        parts = []
+        if start_idx > 0:
+            parts.append(f"... (строки 1–{start_idx} пропущены)")
+        for i in range(start_idx, end_idx):
+            parts.append(f"{i + 1}: {lines[i]}")
+        if end_idx < len(lines):
+            parts.append(f"... (строки {end_idx + 1}–{len(lines)} пропущены)")
+
+        excerpt = "\n".join(parts)
+        print(f"   📍 Фрагмент: строки {start_line}–{end_line} "
+              f"(±{context_lines}) из {len(lines)}")
+        return excerpt[:FILE_LIMIT]
+
+    # Нет диапазона — полный файл
+    if len(raw) > FILE_LIMIT:
+        return raw[:FILE_LIMIT] + "\n... (обрезано)"
+    return raw
+
+
+def _run_pipeline(task: str, files: list[str], rwkv_memo: str) -> str:
+    """
+    Последовательный пайплайн агентов с накопленным контекстом.
+
+    Порядок стадий берётся из pipeline.json клиентского проекта.
+    Каждая стадия получает весь накопленный контекст и добавляет своё мемо.
+    Поддерживает passes > 1: агенты прогоняются N раз, каждый следующий
+    прогон видит мемо всех предыдущих → уточнение.
+    Лог рассуждений пишется в _pipeline_log.md клиентского проекта.
+    Финальная стадия 'coder' генерирует unified diff.
+
+    Возвращает ответ кодера (diff).
+    """
+    from cognit_pipeline import load_pipeline, describe_pipeline
+
+    cfg        = _echo_config() or {}
+    client_dir = cfg.get("client_project", "")
+    pipeline   = load_pipeline(client_dir)
+    stages     = [s for s in pipeline.get("stages", []) if s.get("enabled", True)]
+    passes     = max(1, int(pipeline.get("passes", 1)))
+
+    # ── Лог рассуждений ──────────────────────────────────────────────────────
+    log_path: Path | None = Path(client_dir) / "_pipeline_log.md" if client_dir else None
+    if log_path:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        log_path.write_text(
+            f"# Pipeline: {task[:80]}\n_{ts}_\n\n",
+            encoding="utf-8",
+        )
+
+    def _log(section: str, content: str) -> None:
+        if log_path:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"## {section}\n{content.strip()}\n\n")
+
+    # ── Описание пайплайна ───────────────────────────────────────────────────
+    suffix = f", {passes} прогона" if passes > 1 else ""
+    print(f"\n🚀 Пайплайн  ({len(stages)} стадий{suffix})")
+    print(describe_pipeline(pipeline))
+    print("─" * 50)
+
+    # Удаляем предыдущий temp-паттерн если был
+    for ext in (".pkl", ".json"):
+        p = Path(PATTERNS_DIR) / f"_pipeline{ext}"
+        if p.exists():
+            p.unlink()
+
+    # ── Shared context: задача + файлы (сфокусированные по мемо) ────────────
+    shared = f"## Задача\n{task}\n\n"
+    _log("Задача", task)
+
+    for fpath in files:
+        try:
+            content = _focused_file_content(fpath, rwkv_memo)
+            fname   = Path(fpath).name
+            shared += f"## Файл: {fname}\n```\n{content}\n```\n\n"
+            _log(f"Файл: {fname}", f"```\n{content}\n```")
+        except Exception as e:
+            print(f"   ⚠️  {fpath}: {e}")
+
+    # ── RWKV мемо — однократно в начале ─────────────────────────────────────
+    rwkv_stage = next((s for s in stages if s.get("type") == "rwkv"), None)
+    if rwkv_stage and rwkv_memo:
+        shared += f"## Навигация (RWKV)\n{rwkv_memo}\n\n"
+        _log("Навигация (RWKV)", rwkv_memo)
+        print(f"\n[rwkv] navigator")
+        print(f"   → {rwkv_memo[:120]}")
+    elif rwkv_stage:
+        print(f"\n[rwkv] navigator  — нет мемо (пропуск)")
+
+    # Только agent-стадии; coder — отдельно в конце
+    agent_stages = [s for s in stages if s.get("type") == "agent"]
+    coder_stage  = next((s for s in stages if s.get("type") == "coder"), None)
+
+    # ── Прогоны агентов (passes раз) ─────────────────────────────────────────
+    coder_response = ""
+
+    for pass_num in range(1, passes + 1):
+        if passes > 1:
+            print(f"\n{'═' * 50}")
+            print(f"  Прогон {pass_num} / {passes}")
+            print(f"{'═' * 50}")
+            _log(f"─── Прогон {pass_num} / {passes}", "")
+
+        for stage in agent_stages:
+            sid        = stage.get("id", "agent")
+            agent_name = stage.get("name", sid)
+            role       = stage.get("role", "").replace("{task}", task)
+            label      = f"{sid}" + (f"  (прогон {pass_num})" if passes > 1 else "")
+
+            print(f"\n[agent] {label}")
+
+            if not core.pattern_exists(PATTERNS_DIR, agent_name):
+                print(f"   ⚠️  Паттерн '{agent_name}' не найден — пропуск")
+                continue
+
+            memo = _chain_ask(agent_name, shared, role)
+            if memo and memo.strip():
+                title = f"{sid}" + (f" · прогон {pass_num}" if passes > 1 else "")
+                shared += f"## {title}\n{memo.strip()}\n\n"
+                _log(title, memo.strip())
+
+    # ── Кодер — финальная стадия ─────────────────────────────────────────────
+    if coder_stage:
+        role       = coder_stage.get("role", "").replace("{task}", task)
+        file_names = ", ".join(Path(f).name for f in files)
+
+        print(f"\n[coder] coder")
+        print(f"   Контекст: {len(shared.split())} слов  |  {len(files)} файл(ов)")
+
+        save_pattern("_pipeline", shared, grow_policy="retrain")
+        coder_q = (
+            f"Задача: {task}\n\n"
+            f"Файлы: {file_names}\n\n"
+            f"{role}"
+        )
+        coder_response, _ = ask_pattern("_pipeline", coder_q, grow=False)
+
+        if coder_response:
+            _log("Coder (diff)", coder_response)
+            if "```" in coder_response:
+                print("\n💡 Diff готов → /patch")
+
+    if log_path and log_path.exists():
+        print(f"\n📄 Лог: {log_path}")
+
+    return coder_response or ""
+
+
 def _peek_pattern(name: str, prompt: str) -> str | None:
     """
     Тихий инференс на паттерне без вывода и без сохранения состояния.
@@ -385,39 +597,6 @@ def _peek_pattern(name: str, prompt: str) -> str | None:
     except Exception:
         return None
 
-
-def _generate_agent_card(name: str, agent_dir: Path):
-    """
-    Генерирует card.md для агента через его собственный KV-cache.
-    Модель описывает себя: область знаний и когда её надо активировать.
-    Вызывается после создания паттерна если card.md не существует.
-    """
-    card_path = agent_dir / "card.md"
-    if card_path.exists():
-        return
-    if not core.pattern_exists(PATTERNS_DIR, name):
-        return
-
-    prompt = (
-        f"Ты агент '{name}'. Опиши себя для системы автоматического роутинга.\n"
-        "Ответь ровно двумя строками:\n"
-        "Область: [что ты знаешь — одна строка]\n"
-        "Применяй когда: [в каких ситуациях активировать — одна строка]\n"
-        "Только эти две строки. Без комментариев."
-    )
-    print(f"   🃏 Генерирую card.md для {name}...", end=" ", flush=True)
-    response = _peek_pattern(name, prompt)
-    if not response:
-        print("(нет ответа)")
-        return
-
-    lines = [l.strip() for l in response.splitlines() if l.strip() and not l.startswith("<")]
-    card_lines = [l for l in lines if l.startswith("Область:") or l.startswith("Применяй когда:")]
-    if not card_lines:
-        card_lines = lines[:3]  # fallback: первые строки
-
-    card_path.write_text(f"# {name}\n\n" + "\n".join(card_lines) + "\n", encoding="utf-8")
-    print("✓")
 
 
 def _maybe_expand(pattern_name: str, question: str, response: str) -> dict | None:
@@ -514,33 +693,43 @@ def _find_or_load_agent(agent_name: str) -> str | None:
 
 def _chain_ask(base_pattern: str, extra_text: str, question: str) -> str:
     """
-    Стекает extra_text поверх KV-cache base_pattern и задаёт вопрос.
+    Задаёт вопрос через KV-cache base_pattern с дополнительным контекстом.
+    extra_text и question объединяются в один ChatML user-message —
+    это критично для Qwen3: сырой текст между turns ломает ChatML и
+    вызывает немедленный <|im_end|> без ответа.
     Состояние НЕ сохраняется — эфемерная сессия (паттерн не меняется).
     """
-    print(f"\n🔗 Цепочка: [{base_pattern}] + контент")
+    print(f"\n🔗 Цепочка: [{base_pattern}]")
     if not load_pattern(base_pattern):
         return ""
 
-    # Eval дополнительного контента поверх загруженного состояния
-    injection = f"\n\n# Контент для анализа:\n\n{extra_text.strip()}\n"
-    inj_tokens = llm.tokenize(injection.encode("utf-8"), add_bos=False)
-    if inj_tokens:
-        if len(inj_tokens) > N_CTX // 2:
-            print(f"⚠️  Контент большой ({len(inj_tokens)} токенов), обрезаем")
-            inj_tokens = inj_tokens[:N_CTX // 2]
-        print(f"   Контент: {len(inj_tokens)} токенов  (eval, не сохраняется)")
-        llm.eval(inj_tokens)
+    # Единый ChatML user-message: контекст + вопрос вместе.
+    # Нельзя инжектировать extra_text как сырой текст после <|im_end|> —
+    # Qwen3 сразу ответит <|im_end|> из-за нарушения формата.
+    suffix   = f"\n\n{question}\n<|im_end|>\n<|im_start|>assistant\n"
+    prefix   = "<|im_start|>user\n"
+    body     = extra_text.strip()
 
-    q_prompt = _question_prompt(question)
-    q_tokens = llm.tokenize(q_prompt.encode("utf-8"), add_bos=False)
+    suffix_tokens = llm.tokenize(suffix.encode("utf-8"),  add_bos=False)
+    prefix_tokens = llm.tokenize(prefix.encode("utf-8"),  add_bos=False)
+    body_tokens   = llm.tokenize(body.encode("utf-8"),    add_bos=False)
 
+    max_body = N_CTX // 2 - len(prefix_tokens) - len(suffix_tokens)
+    if len(body_tokens) > max_body:
+        print(f"⚠️  Контент большой ({len(body_tokens)} токенов), обрезаем до {max_body}")
+        body_tokens = body_tokens[:max_body]
+
+    tokens = prefix_tokens + body_tokens + suffix_tokens
+    print(f"   Контент: {len(tokens)} токенов")
     print(f"\n❓ {question}")
     print("─" * 50)
 
     collected = []
     answer_started = False
 
-    for token_id in llm.generate(q_tokens, reset=False, temp=0.3, top_p=0.9, repeat_penalty=1.1):
+    # generate(tokens, reset=False): обрабатывает tokens как продолжение KV-state,
+    # затем генерирует ответ.
+    for token_id in llm.generate(tokens, reset=False, temp=0.3, top_p=0.9, repeat_penalty=1.1):
         piece = llm.detokenize([token_id]).decode("utf-8", errors="replace")
         collected.append(piece)
         full = "".join(collected)
@@ -558,6 +747,10 @@ def _chain_ask(base_pattern: str, extra_text: str, question: str) -> str:
                         after = after[:after.index(stop)]
                 if after.strip():
                     print(after, end="", flush=True)
+                answer_started = True
+            elif not any(("<|im" in full, "<think>" in full)):
+                # /no_think: модель отвечает без <think> — выводим сразу
+                print(clean_piece, end="", flush=True)
                 answer_started = True
         else:
             print(clean_piece, end="", flush=True)
@@ -580,7 +773,14 @@ def _chain_ask(base_pattern: str, extra_text: str, question: str) -> str:
     print("\n" + "─" * 50)
     print("   🔗 Цепочка завершена — паттерн не изменён")
 
-    return "".join(collected)
+    response = "".join(collected)
+    # Убираем думательный блок если есть
+    if "</think>" in response:
+        response = response.split("</think>", 1)[1]
+    for stop in STOP_TOKENS:
+        if stop in response:
+            response = response[:response.index(stop)]
+    return response.strip()
 
 
 def _do_edit(file_path: str, task: str, base_pattern: str | None = None) -> str:
@@ -743,14 +943,24 @@ def _auto_init_agents():
     """
     При старте проверяет агентов из agents/ клиентского проекта.
     Если паттерн агента не создан — создаёт автоматически.
-    Также создаёт оркестратор-паттерн из card.md файлов агентов.
     Вызывается один раз в начале cli_loop().
     """
     cfg = _echo_config()
     client = cfg.get("client_project", "")
 
+    # cognit — служебный агент (handoff.md), не требует паттерна
+    _SYSTEM_AGENTS = {"cognit"}
+
+    # Удаляем служебные паттерны если они были ошибочно созданы
+    for _sa in _SYSTEM_AGENTS | {"orchestrator"}:
+        for ext in (".pkl", ".json"):
+            _p = Path(PATTERNS_DIR) / f"{_sa}{ext}"
+            if _p.exists():
+                _p.unlink()
+
     agents = _list_agents(PATTERNS_DIR)
-    missing = [(name, loaded) for name, loaded in agents if not loaded]
+    missing = [(name, loaded) for name, loaded in agents
+               if not loaded and name not in _SYSTEM_AGENTS]
 
     if missing and client:
         print(f"\n🔄 Авто-инициализация агентов ({len(missing)} из {len(agents)})...")
@@ -759,41 +969,21 @@ def _auto_init_agents():
             if agent_dir.exists():
                 print(f"   Загружаю агента: {name}  ({agent_dir})")
                 _load_path(name, str(agent_dir))
-                # Генерируем card.md из KV-cache если его ещё нет
-                _generate_agent_card(name, agent_dir)
             else:
                 print(f"   ⚠️  Папка агента не найдена: {agent_dir}")
         print()
-
-    # Генерируем card.md для уже загруженных агентов у которых карточки нет
-    if client:
-        agents_root = Path(client) / "agents"
-        for name, loaded in agents:
-            if not loaded:
-                continue
-            agent_dir = agents_root / name
-            if agent_dir.exists() and not (agent_dir / "card.md").exists():
-                _generate_agent_card(name, agent_dir)
-
-    # Оркестратор: создаём из card.md если паттерна ещё нет
-    if client and not core.pattern_exists(PATTERNS_DIR, "orchestrator"):
-        agents_root = Path(client) / "agents"
-        cards = sorted(agents_root.glob("*/card.md")) if agents_root.exists() else []
-        if cards:
-            combined = "\n\n---\n\n".join(
-                c.read_text(encoding="utf-8", errors="ignore") for c in cards
-            )
-            print(f"   🎯 Создаю оркестратор из {len(cards)} card.md...")
-            save_pattern("orchestrator", combined, grow_policy="retrain")
-            print()
 
 
 # Ключевые слова для авто-подбора агентов.
 # Агент активируется если вопрос содержит хотя бы одно слово из списка.
 # Пополняется при появлении новых агентов — или через keywords.txt в папке агента.
 _AGENT_KEYWORDS: dict[str, list[str]] = {
+    # style подключается при любом написании/исправлении кода
     "style":   ["стиль", "style", "форматирование", "naming", "конвенция",
-                "оформление", "lint", "pep8", "отступ", "импорт"],
+                "оформление", "lint", "pep8", "отступ", "импорт",
+                "поправ", "исправ", "напиши", "написать", "создай", "создать",
+                "добавь", "добавить", "реализ", "перепиш", "рефактор",
+                "fix", "write", "create", "implement", "refactor", "update"],
     "arch":    ["архитектур", "arch", "структур", "design", "паттерн", "pattern",
                 "зависимост", "модул", "слой", "layer", "интерфейс"],
     "context": ["контекст", "context", "проект", "цель", "требовани", "бизнес",
@@ -827,27 +1017,6 @@ def _suggest_agents(question: str) -> list[str]:
     return suggested
 
 
-def _orchestrator_agents(question: str, available: list[str]) -> list[str]:
-    """
-    Запрашивает оркестратор-паттерн для выбора агентов под конкретный вопрос.
-    Возвращает список агентов или [] если оркестратора нет либо он не нужен.
-    """
-    if not core.pattern_exists(PATTERNS_DIR, "orchestrator") or not available:
-        return []
-    routing_prompt = (
-        f"Вопрос пользователя: \"{question[:200]}\"\n"
-        f"Доступные агенты: {', '.join(available)}\n"
-        "Какие агенты нужны? Перечисли только имена через запятую. "
-        "Если ни один не нужен — ответь: none"
-    )
-    print("   🎯 Оркестратор...", end=" ", flush=True)
-    response = _peek_pattern("orchestrator", routing_prompt)
-    if not response:
-        print()
-        return []
-    result = [n for n in available if n.lower() in response.lower()]
-    print(", ".join(result) if result else "none")
-    return result
 
 
 def _find_rwkv_index() -> str | None:
@@ -892,7 +1061,7 @@ def cli_loop(auto_route: bool = False, pending: dict = None) -> dict | None:
     list_patterns()
     _auto_init_agents()
 
-    # Если RWKV оставил маршрут — загружаем файлы (авто или с вопросом)
+    # Если RWKV оставил маршрут — запускаем пайплайн агентов
     active = None
     active_policy = None
     last_response = ""
@@ -900,54 +1069,33 @@ def cli_loop(auto_route: bool = False, pending: dict = None) -> dict | None:
     route = pending if (pending and pending.get("action") == "route") else core.load_last_route(PATTERNS_DIR)
     if route:
         age_min = int((datetime.now() - datetime.fromisoformat(route["routed_at"])).total_seconds() / 60)
-        print(f"\n💡 Маршрут от RWKV ({age_min} мин назад): «{route['task']}»")
-        print(f"   Файлов: {len(route['files'])}")
-        for f in route["files"]:
-            print(f"   • {f}")
+        task     = route.get("original_question") or route.get("task", "")
+        files    = [f for f in route.get("files", []) if os.path.exists(f)]
+        rwkv_memo = route.get("context_note", "")
 
-        if auto_route:
-            ans = "y"
-            print("   Загружаю автоматически...")
-        else:
+        print(f"\n💡 Маршрут от RWKV ({age_min} мин назад): «{task}»")
+        print(f"   Файлов: {len(files)}")
+        for f in files:
+            print(f"   • {f}")
+        if rwkv_memo:
+            print(f"   🗺 {rwkv_memo[:120]}")
+
+        if not auto_route:
             try:
-                ans = input("   Загрузить все? [y/N] ").strip().lower()
+                ans = input("\n   Запустить пайплайн? [Y/n] ").strip().lower()
             except (KeyboardInterrupt, EOFError):
                 ans = "n"
+            if ans == "n":
+                files = []  # отменяем
 
-        if ans == "y":
-            last_loaded = None
-            for fpath in route["files"]:
-                if os.path.exists(fpath):
-                    stem = Path(fpath).stem.replace("-", "_").replace(".", "_")
-                    _load_path(stem, fpath)
-                    last_loaded = stem
-                else:
-                    print(f"   ⚠️  Не найден: {fpath}")
-            if last_loaded:
-                active = last_loaded  # сразу активируем последний загруженный
-                active_policy = (core.read_meta(PATTERNS_DIR, active) or {}).get("grow_policy", "retrain")
-                print(f"\n✅ Готов. Активный паттерн: {active}")
-
-                # Zero-touch: авто-задаём исходный вопрос пользователя
-                orig_q = route.get("original_question", "")
-                if orig_q and route.get("auto"):
-                    print(f"\n🎯 Авто-вопрос: «{orig_q}»")
-                    valid_files = [f for f in route.get("files", []) if os.path.exists(f)]
-                    if len(valid_files) == 1:
-                        # Один файл → читаем свежо, точный diff
-                        last_response = _do_edit(valid_files[0], orig_q, active)
-                        if last_response:
-                            print("\n💡 Применить? → /patch")
-                    else:
-                        # Несколько файлов → ask через KV-cache
-                        last_response, handoff = ask_pattern(
-                            active, orig_q, grow=(active_policy == "grow")
-                        )
-                        if handoff:
-                            return handoff
+        if files:
+            last_response = _run_pipeline(task, files, rwkv_memo)
+            active        = "_pipeline"
+            active_policy = "retrain"
 
     if not active:
-        print("\nВыбери паттерн командой 'use <имя>' или '/help' для справки.")
+        print("\n💡 Введи вопрос или задачу — Cognit найдёт нужные файлы автоматически.")
+        print("   Или /load <имя> @<путь> для работы с конкретным файлом.")
 
     while True:
         try:
@@ -1023,12 +1171,12 @@ def cli_loop(auto_route: bool = False, pending: dict = None) -> dict | None:
                         if not last_response:
                             print("❌ Нет предыдущего ответа. Задай вопрос об изменениях, затем /patch.")
                             continue
-                        # Diff не найден — просим модель переформатировать
-                        print("   Diff не найден в последнем ответе — запрашиваю у модели...")
-                        last_response, _ = ask_pattern(
+                        # Diff не найден — инжектируем предыдущий ответ как контекст и просим diff
+                        print("   Diff не найден — переформатирую предыдущий ответ...")
+                        last_response = _chain_ask(
                             active,
-                            "Покажи изменения из предыдущего ответа в виде unified diff (```diff блок).",
-                            grow=False,
+                            f"Предыдущий ответ:\n\n{last_response}",
+                            "Покажи изменения из этого ответа в виде unified diff (```diff блок).",
                         )
                         diff = _extract_diff(last_response)
                     if not diff:
@@ -1039,11 +1187,10 @@ def cli_loop(auto_route: bool = False, pending: dict = None) -> dict | None:
                     if not target:
                         print("❌ Файл не определён. Используй: /patch @<файл>")
                         continue
-                    if not os.path.exists(target):
-                        print(f"❌ Файл не найден: {target}")
-                        continue
+                    is_new = not os.path.exists(target)
                     preview = diff.split('\n')
-                    print(f"\n📋 Diff ({len(preview)} строк)  →  {target}")
+                    label = "НОВЫЙ ФАЙЛ" if is_new else target
+                    print(f"\n📋 Diff ({len(preview)} строк)  →  {label}")
                     print("─" * 60)
                     for ln in preview[:50]:
                         print(ln)
@@ -1051,7 +1198,8 @@ def cli_loop(auto_route: bool = False, pending: dict = None) -> dict | None:
                         print(f"   ... (ещё {len(preview) - 50} строк)")
                     print("─" * 60)
                     try:
-                        ans = input(f"   Применить к '{target}'? [y/N] ").strip().lower()
+                        action = "Создать" if is_new else "Применить"
+                        ans = input(f"   {action} '{target}'? [y/N] ").strip().lower()
                     except (KeyboardInterrupt, EOFError):
                         continue
                     if ans == "y":
@@ -1166,8 +1314,7 @@ def cli_loop(auto_route: bool = False, pending: dict = None) -> dict | None:
                     print("❌ Сначала выбери паттерн: use <имя>")
                     _hint_patterns()
                     continue
-                _loaded = [n for n, ok in _list_agents(PATTERNS_DIR) if ok and n != "orchestrator"]
-                effective_agents = ambient_agents or _orchestrator_agents(question, _loaded) or _suggest_agents(question)
+                effective_agents = ambient_agents or _suggest_agents(question)
                 if effective_agents:
                     if not ambient_agents:
                         print(f"🤖 Авто-агенты: {', '.join(effective_agents)}")
@@ -1176,19 +1323,12 @@ def cli_loop(auto_route: bool = False, pending: dict = None) -> dict | None:
                     )
                     if agent_text:
                         last_response = _chain_ask(active, agent_text, question)
-                        handoff = _maybe_chain_handoff(active, question, last_response)
-                        if handoff:
-                            return handoff
                     else:
-                        last_response, handoff = ask_pattern(active, question, grow=False)
-                        if handoff:
-                            return handoff
+                        last_response, _ = ask_pattern(active, question, grow=False)
                 else:
                     # ? флипает политику: grow→не сохранять, retrain→сохранять
                     flipped_grow = (active_policy == "retrain")
-                    last_response, handoff = ask_pattern(active, question, grow=flipped_grow)
-                    if handoff:
-                        return handoff
+                    last_response, _ = ask_pattern(active, question, grow=flipped_grow)
 
             # ── expand <задача> → handoff to RWKV ───────────────────────────
             elif user_input.lower().startswith("expand ") or user_input.lower() == "expand":
@@ -1208,26 +1348,22 @@ def cli_loop(auto_route: bool = False, pending: dict = None) -> dict | None:
                     continue
                 index = _find_rwkv_index()
                 if not index:
-                    print("❌ Нет RWKV-индекса. Создай его сначала:")
-                    print("   python cognit.py --rwkv")
-                    print("   /load repo @src/")
-                    print("   Затем работай как обычно — Transformer подхватит файлы.")
-                    continue
+                    # Индекса нет — падаём на expand (сам построит индекс)
+                    return _handoff_to_rwkv(active, task, original_question=user_input)
                 print(f"   Найден RWKV-индекс: {index}")
                 return {
                     "action": "expand_route",
                     "task":   task,
                     "index":  index,
+                    "original_question": user_input,
                 }
 
             # ── просто текст → ask ───────────────────────────────────────────
             else:
                 if not active:
-                    print("❌ Сначала выбери паттерн: use <имя>")
-                    _hint_patterns()
-                    continue
-                _loaded = [n for n, ok in _list_agents(PATTERNS_DIR) if ok and n != "orchestrator"]
-                effective_agents = ambient_agents or _orchestrator_agents(user_input, _loaded) or _suggest_agents(user_input)
+                    # Нет паттерна — авто-маршрутизируем через RWKV
+                    return _handoff_to_rwkv(None, user_input, original_question=user_input)
+                effective_agents = ambient_agents or _suggest_agents(user_input)
                 if effective_agents:
                     if not ambient_agents:
                         print(f"🤖 Авто-агенты: {', '.join(effective_agents)}")
@@ -1236,18 +1372,16 @@ def cli_loop(auto_route: bool = False, pending: dict = None) -> dict | None:
                     )
                     if agent_text:
                         last_response = _chain_ask(active, agent_text, user_input)
-                        handoff = _maybe_chain_handoff(active, user_input, last_response)
-                        if handoff:
-                            return handoff
+                        _save_current_kv(active)
                     else:
-                        last_response, handoff = ask_pattern(active, user_input, grow=(active_policy == "grow"))
-                        if handoff:
-                            return handoff
+                        last_response, _ = ask_pattern(active, user_input, grow=(active_policy == "grow"))
                 else:
                     # Следуем политике паттерна: grow сохраняет, retrain — нет
-                    last_response, handoff = ask_pattern(active, user_input, grow=(active_policy == "grow"))
-                    if handoff:
-                        return handoff
+                    last_response, _ = ask_pattern(active, user_input, grow=(active_policy == "grow"))
+
+                # После любого ask: если в ответе есть код — подсказываем /patch
+                if last_response and "```" in last_response:
+                    print("\n💡 Есть код в ответе → /patch")
 
         except KeyboardInterrupt:
             print("\n👋 Выход")

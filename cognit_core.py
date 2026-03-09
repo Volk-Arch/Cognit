@@ -259,15 +259,25 @@ TEXT_EXTENSIONS = {
 }
 
 
-def collect_text_files(dir_path: str | Path) -> list[Path]:
+def collect_text_files(dir_path: str | Path,
+                       exclude_dirs: set[str] | None = None) -> list[Path]:
     """
     Возвращает текстовые файлы из директории.
 
     Если это git-репо — использует `git ls-files` (автоматически
     уважает .gitignore и возвращает только отслеживаемые файлы).
     Иначе — rglob с фильтром по TEXT_EXTENSIONS.
+
+    exclude_dirs: имена папок для исключения (например {"agents"}).
     """
     p = Path(dir_path).resolve()
+    excl = exclude_dirs or set()
+
+    def _keep(f: Path) -> bool:
+        if f.suffix.lower() not in TEXT_EXTENSIONS:
+            return False
+        # Исключаем файлы внутри запрещённых папок
+        return not any(part in excl for part in f.relative_to(p).parts[:-1])
 
     # Пробуем git ls-files
     try:
@@ -278,7 +288,7 @@ def collect_text_files(dir_path: str | Path) -> list[Path]:
         files = []
         for line in result.stdout.splitlines():
             f = (p / line).resolve()
-            if f.is_file() and f.suffix.lower() in TEXT_EXTENSIONS:
+            if f.is_file() and _keep(f):
                 files.append(f)
         if files:
             return sorted(files)
@@ -286,7 +296,4 @@ def collect_text_files(dir_path: str | Path) -> list[Path]:
         pass
 
     # Fallback: rglob без git
-    return sorted(
-        f for f in p.rglob("*")
-        if f.is_file() and f.suffix.lower() in TEXT_EXTENSIONS
-    )
+    return sorted(f for f in p.rglob("*") if f.is_file() and _keep(f))

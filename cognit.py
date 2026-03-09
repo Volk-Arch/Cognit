@@ -15,19 +15,9 @@ RWKV — внутренний инструмент для индексирова
 """
 
 import sys
-import json
-from pathlib import Path
 
 
 def _default_backend() -> str:
-    p = Path(".echo.json")
-    if p.exists():
-        try:
-            cfg = json.loads(p.read_text(encoding="utf-8"))
-            if cfg.get("backend") == "rwkv":
-                return "rwkv"
-        except Exception:
-            pass
     return "transformer"
 
 
