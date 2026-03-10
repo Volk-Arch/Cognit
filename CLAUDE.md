@@ -9,12 +9,13 @@
 
 | Файл | Назначение |
 |---|---|
-| `cognit.py` | Оркестратор — единая точка входа, переключает Transformer ↔ RWKV в одном процессе |
+| `cognit.py` | Единая точка входа — запускает Transformer |
 | `cognit_transformer.py` | Transformer-бэкенд (Qwen3-8B). KV-cache → `.pkl` |
-| `cognit_rwkv.py` | RWKV-бэкенд. Рекуррентное состояние, без лимита контекста |
-| `cognit_core.py` | Общие утилиты: git-хелперы, file hash, паттерны, route/expand save/load |
-| `cognit_patch.py` | Применение unified diff к файлам (`/patch`) |
-| `cognit_agents.py` | Работа с agents/: чтение текста, список агентов |
+| `cognit_index.py` | Tree-sitter навигатор: AST-парсинг Python + BM25-поиск по символам |
+| `cognit_core.py` | Общие утилиты: git-хелперы, file hash, паттерны, route save/load |
+| `cognit_pipeline.py` | Конфигурация пайплайна агентов (`pipeline.json`) |
+| `cognit_patch.py` | Применение unified diff к файлам (`/patch`), мульти-файл (`_extract_all_diffs`) |
+| `cognit_agents.py` | Работа с agents/: чтение текста (`read_agent_text`), список агентов |
 | `cognit_setup.py` | Одноразовая настройка: `.echo.json`, `.gitignore`, git-хук, `agents/` |
 | `README.md` | Полная документация: концепция, команды, сценарии, настройка |
 
@@ -24,8 +25,9 @@
 echo_patterns/
   <repo>/
     <branch>/
-      <name>.pkl   ← состояние модели (KV-cache или RWKV state)
-      <name>.json  ← метаданные (токены, дата, backend, source_files, hashes)
+      <name>.pkl           ← KV-cache состояние модели
+      <name>.json          ← метаданные (токены, дата, backend, source_files, hashes)
+      _code_index.json     ← кеш tree-sitter индекса
 
 agents/            ← знания о проекте (в git клиентского проекта!)
   style/global.md
@@ -34,7 +36,6 @@ agents/            ← знания о проекте (в git клиентско
 
 models/            ← GGUF-файлы (в .gitignore)
   Qwen3-8B-GGUF/
-  rwkv/
 ```
 
 ## Два репо: Cognit + клиентский проект
@@ -44,10 +45,10 @@ Cognit живёт в своём репо. Клиентский проект — 
 post-commit хук туда с **абсолютным путём** к `cognit_transformer.py`.
 
 ```json
-// .echo.json — хранит путь к клиентскому проекту
+// .echo.json — хранит путь к клиентскому проекту + конфиг модели
 {
   "backend": "transformer",
-  "model_name": "Qwen3-8B-Q4_K_M",
+  "transformer": { "model_path": "...", "n_gpu_layers": -1, "n_ctx": 8192, "max_tokens": 512 },
   "client_project": "C:/path/to/demo-project"
 }
 ```
@@ -60,61 +61,47 @@ post-commit хук туда с **абсолютным путём** к `cognit_tr
 **KV-cache (Transformer):**
 - `llm.save_state()` / `llm.load_state()` из llama-cpp-python
 - Размер растёт с количеством токенов
+- `llm.tokenize(..., special=True)` — обязательно для ChatML (`<|im_start|>`, `<|im_end|>`)
+- `load_pattern` проверяет совместимость модели (квантизация) через `meta["model"]`
 
-**RWKV state:**
-- Фиксированный размер (~98 KB для 7B) вне зависимости от объёма текста
-- Chunked eval: `llm.eval(chunk)` по 512 токенов — нет лимита контекста
-
-**In-process switching (оркестратор):**
-- `cli_loop()` возвращает `dict | None` вместо subprocess + sys.exit
-- `init_model()` / `unload_model()` в каждом бэкенде
-- Handoff RWKV→Transformer: `{"action": "route", "task": ..., "files": [...]}`
-- Handoff Transformer→RWKV: `{"action": "expand", "task": ..., "from_pattern": ...}`
+**Tree-sitter навигатор (cognit_index.py):**
+- `CodeIndex(project_dir)` — AST-парсинг всех `.py` файлов
+- BM25-поиск по именам символов (функции, классы, импорты) + докстрингам
+- Инкрементальный: пропускает файлы с неизменённым хешем
+- Кеш на диск: `_code_index.json` в директории паттернов
+- Зависимости: `tree-sitter`, `tree-sitter-python`
 
 ## CLI-команды
 
-### Обе модели
 ```
 use <имя>            — выбрать активный паттерн
 <вопрос>             — ask (следует политике: grow/retrain)
 ? <вопрос>           — временно сменить политику (grow↔retrain)
+route <задача>       — найти файлы через tree-sitter индекс → пайплайн
 /load <имя> @<путь>  — загрузить файл или папку как паттерн
 /load ?<имя> @<путь> — загрузить с принудительным retrain
+/patch               — применить все diff-блоки из ответа к файлам
+/patch @<файл>       — применить к конкретному файлу (override)
+/edit @<файл> <задача> — свежее чтение файла → unified diff
+/agents              — список агентов из agents/
+/agent <имя> [имя2 ...]  — ambient: каждый вопрос через [паттерн + агенты]
+/agent off           — выключить ambient
+/review @<файл>      — ревью файла (агент style, эфемерно)
+/review <агент> @<файл>  — ревью через конкретный агент
+/review              — ревью последнего ответа модели
+/style @<файл>       — проверка стиля файла
 /list                — список паттернов
 /help                — справка
 /exit                — выход
 ```
 
-### Только Transformer (cognit_transformer.py)
-```
-expand <задача>             — передать задачу в RWKV (handoff)
-/patch                      — применить diff из последнего ответа к файлу
-/patch @<файл>              — применить к конкретному файлу
-/agents                     — список агентов из agents/
-/agent <имя> [имя2 ...]     — ambient: каждый вопрос через [паттерн + агенты]
-/agent off                  — выключить ambient
-/review @<файл>             — ревью файла (агент style, эфемерно)
-/review <агент> @<файл>     — ревью через конкретный агент
-/review                     — ревью последнего ответа модели
-/style @<файл>              — проверка стиля файла
-```
-
-### Только RWKV (cognit_rwkv.py)
-```
-route <задача>       — найти файлы для задачи → handoff на Transformer
-```
-
 ## Флаги запуска
 
 ```bash
-python cognit.py                              # оркестратор (из .echo.json)
-python cognit.py --rwkv                       # принудительно RWKV
-python cognit.py --transformer                # принудительно Transformer
+python cognit.py                              # единая точка входа
 python cognit_transformer.py                  # Transformer напрямую
 python cognit_transformer.py --refresh-file <path>  # headless: пересоздать паттерн
 python cognit_transformer.py --status         # headless: проверить актуальность
-python cognit_rwkv.py                         # RWKV напрямую
-python cognit_rwkv.py --auto-expand           # принять pending задачу от Transformer
 python cognit_setup.py                        # полная настройка
 python cognit_setup.py agents                 # только создать agents/
 ```
@@ -129,10 +116,20 @@ file_hash(path) → str                    # SHA-256 первых+последн
 pattern_exists(patterns_dir, name) → bool
 check_stale_sources(patterns_dir, name)  # → список изменённых файлов
 collect_text_files(path) → list[Path]    # git ls-files или rglob
-save_route(patterns_dir, index, task, files) → Path         # _route_last.json
-load_last_route(patterns_dir) → dict | None                  # None если >24ч
-save_expand_request(patterns_dir, task, from_pattern, from_sources) → Path
-load_expand_request(patterns_dir) → dict | None              # None если >24ч
+save_route(patterns_dir, index, task, files) → Path   # _route_last.json
+load_last_route(patterns_dir) → dict | None            # None если >24ч
+```
+
+## cognit_index.py — ключевые функции
+
+```python
+CodeIndex(project_dir, cache_dir)        # AST-индекс проекта
+  .build() → int                         # парсит .py файлы, возвращает кол-во
+  .search(query, top_k) → list[SearchResult]  # BM25-поиск по символам
+  .files_for_query(query, top_k) → list[str]  # уникальные файлы
+  .file_summary(filepath) → str          # краткое описание файла
+  .project_summary() → str              # обзор всего проекта
+  .search_summary(query, top_k) → str   # текстовый отчёт для промпта
 ```
 
 ## Post-commit хук
@@ -142,7 +139,32 @@ load_expand_request(patterns_dir) → dict | None              # None если >
 - Вызывает `python /abs/path/cognit_transformer.py --refresh-file <file>` для каждого
 - Паттерны, использующие изменённый файл, пересоздаются автоматически
 
+## Пайплайн агентов — техника
+
+Агенты в `_run_pipeline` работают через **полный eval** (не KV-cache continuation):
+1. `_read_agent_text(name)` — сырой текст из `agents/<name>/`
+2. `save_pattern("_agent_<id>", agent_text + shared)` — полный eval с нуля
+3. `ask_pattern("_agent_<id>", role + "/no_think")` — вопрос к свежему KV-cache
+4. Временный паттерн удаляется после использования
+
+Кодер работает аналогично: `save_pattern("_pipeline", shared)` → `ask_pattern`.
+
+KV-cache continuation (`load_state` + `eval(inject)` + `generate`) ненадёжна
+для больших инжектов (700+ токенов) — модель сразу генерирует `<|im_end|>`.
+
+## cognit_patch.py — ключевые функции
+
+```python
+_extract_diff(text) → str | None         # первый diff-блок из ответа
+_extract_all_diffs(text) → list[str]     # все diff-блоки (мульти-файл)
+_diff_target(diff) → str | None          # путь из заголовка +++
+_is_new_file_diff(diff) → bool           # True если --- /dev/null
+apply_patch(diff, file_path) → bool      # применить diff, создать .cognit.bak
+```
+
+`/patch` в CLI резолвит относительные пути через `client_project` из `.echo.json`.
+
 ## Статус проекта
 
-Proof of concept. Всё работает, покрыто документацией (README.md).
+Proof of concept. Основной функционал работает, покрыт документацией.
 Следующие возможные шаги: S3-синхронизация паттернов, веб-интерфейс, тесты.

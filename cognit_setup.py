@@ -102,15 +102,10 @@ def setup_config():
         print(f"   Найден существующий {ECHO_CONFIG}")
 
     ex_t = existing.get("transformer", {})
-    ex_r = existing.get("rwkv", {})
 
     t_model_path = _ask(
         "   Путь к Transformer-модели (GGUF)",
-        ex_t.get("model_path", "models/Qwen3-8B-GGUF/Qwen3-8B-Q6_K.gguf")
-    )
-    r_model_path = _ask(
-        "   Путь к RWKV-модели (GGUF)  [для route/expand]",
-        ex_r.get("model_path", "models/rwkv/RWKV-6-World-7B-Q4_K_M.gguf")
+        ex_t.get("model_path", "models/Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf")
     )
 
     config = {
@@ -121,13 +116,6 @@ def setup_config():
             "n_gpu_layers": ex_t.get("n_gpu_layers", -1),
             "n_ctx":        ex_t.get("n_ctx", 8192),
             "max_tokens":   ex_t.get("max_tokens", 512),
-        },
-        "rwkv": {
-            "model_path":   r_model_path,
-            "n_gpu_layers": ex_r.get("n_gpu_layers", -1),
-            "n_ctx":        ex_r.get("n_ctx", 1024),
-            "max_tokens":   ex_r.get("max_tokens", 512),
-            "chunk_size":   ex_r.get("chunk_size", 512),
         },
         "_note": (
             "Все участники команды должны использовать одну модель. "
@@ -228,60 +216,6 @@ def setup_hook(target_git_root: Path, echo_script_path: Path):
         pass
 
     print(f"   ✅ Хук установлен: {hook_path}")
-
-
-# =============================================================================
-# ШАГ 3b: post-checkout хук
-# =============================================================================
-def _make_checkout_hook_script(rwkv_script_path: str) -> str:
-    posix_path = Path(rwkv_script_path).as_posix()
-    return f"""\
-#!/bin/sh
-# Cognit — post-checkout hook
-# Проверяет наличие RWKV-индекса для новой ветки.
-
-PREV_HEAD=$1
-NEW_HEAD=$2
-IS_BRANCH_CHECKOUT=$3
-
-# Запускаем только при смене ветки (не при checkout файла)
-if [ "$IS_BRANCH_CHECKOUT" != "1" ]; then
-    exit 0
-fi
-
-RWKV_SCRIPT="{posix_path}"
-if [ ! -f "$RWKV_SCRIPT" ]; then
-    exit 0
-fi
-
-python "$RWKV_SCRIPT" --check-index 2>/dev/null
-"""
-
-
-def setup_checkout_hook(target_git_root: Path, rwkv_script_path: Path):
-    """Устанавливает post-checkout хук в указанный git-репозиторий."""
-    hook_path = target_git_root / ".git" / "hooks" / "post-checkout"
-
-    if hook_path.exists():
-        overwrite = _ask_yn(
-            f"   post-checkout хук уже существует в {target_git_root.name}. Перезаписать?",
-            default=False,
-        )
-        if not overwrite:
-            print("   Пропускаю.")
-            return
-
-    hook_path.parent.mkdir(parents=True, exist_ok=True)
-    hook_path.write_text(_make_checkout_hook_script(str(rwkv_script_path)), encoding="utf-8")
-
-    try:
-        import stat
-        st = os.stat(hook_path)
-        os.chmod(hook_path, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-    except Exception:
-        pass
-
-    print(f"   ✅ post-checkout хук установлен: {hook_path}")
 
 
 # =============================================================================
@@ -524,67 +458,6 @@ P(H|E) = P(E|H) × P(H)
 - P(E|¬H) — вероятность свидетельства если гипотеза неверна
 - P(H|E) — апостериорная вероятность (после наблюдения, становится новым prior)
 """,
-
-    "cognit/handoff.md": """\
-# Cognit — система двух нейросетей
-
-Ты работаешь в системе Cognit. Она состоит из двух локальных LLM, которые передают
-управление друг другу через файлы `_route_last.json` / `_expand_last.json`.
-
----
-
-## Два бэкенда
-
-### Transformer — cognit_transformer.py (текущий, если этот файл загружен через него)
-- Хранит контекст в KV-cache
-- Лимит: 8192 токенов
-- Сильная сторона: точный анализ конкретного кода, детальные вопросы по загруженным файлам
-- Слабая сторона: не видит файлы, которые не были загружены явно
-
-### RWKV — cognit_rwkv.py
-- Хранит контекст в рекуррентном состоянии фиксированного размера (~98 KB)
-- Лимит: отсутствует — читает любой объём текста
-- Сильная сторона: весь проект целиком, навигация по кодовой базе, маршрутизация
-- Слабая сторона: чуть менее точна на детальных вопросах
-
----
-
-## Команды переключения
-
-### `expand <задача>` — из Transformer в RWKV
-Используй эту команду, когда:
-- Пользователь спрашивает о файле/модуле, который не загружен
-- Нужно понять, где в проекте что-то находится
-- Задача требует обзора всей архитектуры
-- Непонятно, какие файлы затронет изменение
-
-Пример предложения пользователю:
-> Этот модуль не в моём контексте. Попробуй: `expand нужен контекст по модулю оплаты`
-
-### `route <задача>` — из RWKV в Transformer
-Используй после того как RWKV нашёл нужные файлы.
-Transformer загружает именно их и работает точно.
-
----
-
-## Когда предлагать переключение
-
-| Ситуация | Предложи |
-|---|---|
-| «в каком файле находится X?» | `expand найти где реализован X` |
-| «покажи все места, где используется Y» | `expand найти использование Y` |
-| «какие файлы затронет задача Z» | `expand задача Z — нужен роутинг` |
-| «проанализируй конкретный файл» | загрузи файл через `/load` или предложи `route` в RWKV |
-| «есть ли уязвимости в этом коде» | работай сам — файл уже загружен |
-
----
-
-## Важно
-
-Ты не можешь сам выполнить переключение — только предложить пользователю команду.
-Пользователь вводит `expand <задача>` (в Transformer) или `route <задача>` (в RWKV),
-и система автоматически передаёт управление.
-""",
 }
 
 
@@ -622,7 +495,6 @@ def setup_agents(target_dir: Path | None = None):
        style/commands.md  — стиль CLI-вывода (дефолт: заполнен)
        arch/overview.md   — архитектура (замени на свою структуру)
        context/project.md — цели, решения, ограничения (замени)
-       cognit/handoff.md  — система двух нейросетей (не менять)
 
    Cognit при следующем запуске автоматически:
      1. Загрузит агентов из этих папок и создаст KV-cache паттерны
@@ -682,28 +554,24 @@ def main():
     config = setup_config()
     setup_gitignore()
 
-    # Абсолютный пути к скриптам (для прописывания в хуки)
+    # Абсолютный путь к скрипту (для прописывания в хук)
     echo_dir = Path(__file__).parent.resolve()
     transformer_script = echo_dir / "cognit_transformer.py"
-    rwkv_script        = echo_dir / "cognit_rwkv.py"
 
     # Хуки в основном (клиентском) проекте
     client_root = _ask_client_project()
     if client_root:
         if _ask_yn(f"\n   Установить post-commit хук в {client_root.name}?", default=True):
             setup_hook(client_root, transformer_script)
-        if _ask_yn(f"   Установить post-checkout хук в {client_root.name}? (уведомление о RWKV-индексе)", default=True):
-            setup_checkout_hook(client_root, rwkv_script)
         # Сохраняем путь к клиентскому проекту в .echo.json
         config["client_project"] = str(client_root)
         with open(ECHO_CONFIG, "w", encoding="utf-8") as f:
             json.dump(config, f, ensure_ascii=False, indent=2)
         print(f"   ✅ client_project сохранён в {ECHO_CONFIG}")
 
-    # Хуки в самом Cognit-репозитории (опционально)
-    if git_root and _ask_yn("\nУстановить хуки и в Cognit-репозитории?", default=False):
+    # Хук в самом Cognit-репозитории (опционально)
+    if git_root and _ask_yn("\nУстановить post-commit хук и в Cognit-репозитории?", default=False):
         setup_hook(git_root, transformer_script)
-        setup_checkout_hook(git_root, rwkv_script)
 
     if _ask_yn("\nСоздать папку agents/ с шаблонами?", default=True):
         setup_agents(client_root)  # None если клиент не задан → создаст в CWD

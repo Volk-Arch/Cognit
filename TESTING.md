@@ -8,7 +8,7 @@
 
 - Python 3.11+
 - CUDA 12.1+ (для GPU-режима) или CPU (медленно, но работает)
-- ~6 GB свободной VRAM для одной модели (модели работают последовательно, не параллельно)
+- ~5 GB свободной VRAM для модели
 - git
 
 ---
@@ -27,27 +27,29 @@ cd Cognit
 **GPU (CUDA 12.1):**
 ```bash
 pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
+pip install tree-sitter tree-sitter-python
 ```
 
 **CPU (без GPU):**
 ```bash
 pip install llama-cpp-python
+pip install tree-sitter tree-sitter-python
 ```
 
 Проверка:
 ```bash
 python -c "from llama_cpp import Llama; print('OK')"
+python -c "from cognit_index import CodeIndex; print('OK')"
 ```
 
 ---
 
-## Шаг 3 — Скачиваем модели
+## Шаг 3 — Скачиваем модель
 
-Создаём папку и скачиваем хотя бы одну модель:
+Создаём папку и скачиваем модель:
 
 ```bash
 mkdir -p models/Qwen3-8B-GGUF
-mkdir -p models/rwkv
 ```
 
 **Transformer (Qwen3-8B, ~4.7 GB VRAM):**
@@ -57,20 +59,11 @@ https://huggingface.co/Qwen/Qwen3-8B-GGUF
 ```
 Положить в `models/Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf`
 
-**RWKV (~4.1 GB VRAM, опционально — нужен для пайплайна):**
-Скачать `RWKV-6-World-7B-Q4_K_M.gguf` с HuggingFace:
-```
-https://huggingface.co/bartowski/RWKV-x060-World-7B-v2.1-GGUF
-```
-Положить в `models/rwkv/RWKV-6-World-7B-Q4_K_M.gguf`
-
-> Для базового теста только Transformer достаточно.
-
 ---
 
 ## Шаг 4 — Подготавливаем клиентский проект
 
-Нужен любой git-репо с кодом. Можно создать тестовый:
+Нужен любой git-репо с Python-кодом. Можно создать тестовый:
 
 ```bash
 mkdir -p /path/to/my-project/src
@@ -94,7 +87,6 @@ python cognit_setup.py
 Путь к клиентскому проекту: /path/to/my-project
 Путь к Transformer модели [models/Qwen3-8B-GGUF/...]: <Enter>
 GPU layers [-1]: <Enter>
-Путь к RWKV модели [models/rwkv/...]: <Enter>
 Установить post-commit хук? [Y/n]: y
 ```
 
@@ -107,7 +99,6 @@ cat .echo.json
 {
   "backend": "transformer",
   "transformer": { "model_path": "models/...", ... },
-  "rwkv": { ... },
   "client_project": "/path/to/my-project"
 }
 ```
@@ -116,8 +107,6 @@ cat .echo.json
 ```bash
 ls /path/to/my-project/agents/
 # style/  arch/  context/
-cat /path/to/my-project/agents/style/global.md
-# Должен быть реальный Python style guide, не заглушки
 ```
 
 **Проверка — pipeline.json создан:**
@@ -136,29 +125,20 @@ python cognit.py
 
 Ожидаемый вывод:
 ```
-Cognit · Transformer (Qwen3-8B-Q4_K_M) | GPU | слои: -1 | ctx: 8192
+🧠 Transformer · Qwen3-8B-Q4_K_M · my-project/main
 
 🔄 Авто-инициализация агентов (3 из 3)...
    Загружаю агента: style  (...)
-   🃏 Генерирую card.md для style... ✓
    Загружаю агента: arch  (...)
-   🃏 Генерирую card.md для arch... ✓
    Загружаю агента: context  (...)
-   🃏 Генерирую card.md для context... ✓
 
 📋 Паттернов: 3
-  • style  [T]  2026-03-09
-  • arch   [T]  2026-03-09
-  • context [T] 2026-03-09
+  • style  [T]  2026-03-10
+  • arch   [T]  2026-03-10
+  • context [T] 2026-03-10
 
 🧠>
 ```
-
-**Что проверяем:**
-- Модель загрузилась без ошибок (однострочный баннер без рамки)
-- Агенты инициализировались автоматически (паттернов не было — создались)
-- `card.md` сгенерированы для каждого агента в `agents/*/card.md`
-- `/list` — компактный формат, одна строка на паттерн
 
 ---
 
@@ -170,7 +150,7 @@ Cognit · Transformer (Qwen3-8B-Q4_K_M) | GPU | слои: -1 | ctx: 8192
 ```
 
 **Что проверяем:**
-- Паттерн создался: `echo_patterns/<repo>/main/main.pkl`
+- Паттерн создался
 - Модель ответила на вопрос о `hello()`
 - Промпт переключился на `🧠 [main]>`
 
@@ -182,22 +162,12 @@ Cognit · Transformer (Qwen3-8B-Q4_K_M) | GPU | слои: -1 | ctx: 8192
 🧠 [main]> есть ли способ сделать это лучше?
 ```
 
-Должно появиться `[main~]` — паттерн растёт:
-
-Проверяем в `/list`:
-```
-🧠 [main~]> /list
-  main~   (grow)  tokens: ...
-  style   (retrain)
-  arch    (retrain)
-  context (retrain)
-```
+Должно появиться `[main~]` — паттерн растёт.
 
 ---
 
 ## Шаг 9 — Авто-выбор агентов (keyword)
 
-Спрашиваем что-то про стиль:
 ```
 🧠 [main~]> как правильно назвать эту функцию по конвенциям стиля?
 ```
@@ -205,181 +175,50 @@ Cognit · Transformer (Qwen3-8B-Q4_K_M) | GPU | слои: -1 | ctx: 8192
 Ожидаем:
 ```
 🤖 Авто-агенты: style
-[модель отвечает с учётом style-агента]
 ```
-
-Keyword-matching по словам: `стиль`, `style`, `именован`, `назван`, `конвенц` — подключает style-агента.
 
 ---
 
 ## Шаг 10 — /patch: правим код
 
-Просим модель исправить что-то:
 ```
 🧠 [main~]> переименуй функцию hello в greet и добавь параметр name: str
-```
-
-Если в ответе есть diff-блок — появится подсказка:
-```
-💡 Есть код в ответе → /patch
-```
-
-Пробуем:
-```
 🧠 [main~]> /patch
 ```
 
-Ожидаем:
-```
-Применить патч к src/main.py? [y/N]: y
-✅ Патч применён → src/main.py
-   Бэкап: src/main.py.cognit.bak
-```
-
-Если diff не было в ответе — модель переспрашивается автоматически:
-```
-⚠️  Diff не найден в ответе. Запрашиваю у модели...
-[модель генерирует diff]
-Применить патч к src/main.py? [y/N]: y
-```
-
-**Проверка:**
-```bash
-cat /path/to/my-project/src/main.py
-# Должна быть функция greet(name: str)
-cat /path/to/my-project/src/main.py.cognit.bak
-# Исходный файл
-```
+**Путь резолвится через `client_project`** — относительный `main.py` из diff-заголовка автоматически превращается в абсолютный путь клиентского проекта.
 
 ---
 
 ## Шаг 10б — /patch для нового файла
 
-Просим создать новый файл:
 ```
-🧠 [main~]> создай src/utils.py с функцией format_name(name: str) -> str
-```
-
-Ожидаем diff с `--- /dev/null`:
-```diff
---- /dev/null
-+++ b/src/utils.py
-@@ -0,0 +1,5 @@
-+def format_name(name: str) -> str:
-+    ...
-```
-
-```
+🧠 [main~]> создай src/utils.py с функцией format_name
 🧠 [main~]> /patch
-НОВЫЙ ФАЙЛ: src/utils.py
-Создать? [y/N]: y
-✅ Файл создан → src/utils.py
 ```
+
+Ожидаем `НОВЫЙ ФАЙЛ: src/utils.py`.
 
 ---
 
-## Шаг 10в — /edit: точная правка файла
+## Шаг 10в — /patch: несколько файлов
 
-`/edit` читает файл заново (не из KV-cache паттерна) и сразу просит diff:
+Если модель сгенерировала несколько diff-блоков:
 
 ```
-🧠 [main~]> /edit @src/main.py добавь docstring к функции greet
-```
-
-Ожидаем:
-```
-📄 /edit src/main.py  →  добавь docstring к функции greet
-[модель читает файл и выдаёт unified diff]
-💡 Применить? → /patch
-```
-
-Затем:
-```
+🧠 [main~]> добавь валидацию в main.py и создай src/validators.py
 🧠 [main~]> /patch
-✅ Патч применён → src/main.py
 ```
 
-**Когда /edit лучше /patch:**
-- Нужна точная правка конкретной строки, а не «по памяти» из паттерна
-- Паттерн давно создан и файл мог измениться
-- Хочешь гарантированно получить diff, а не объяснение
+Ожидаем: `📋 Найдено 2 diff-блоков`, отдельный запрос подтверждения для каждого.
 
 ---
 
-## Шаг 11 — /agent ambient
+## Шаг 11 — Пайплайн (tree-sitter навигация)
 
-```
-🧠 [main~]> /agent style arch
-🔗 Ambient агенты: style + arch
-   Каждый вопрос будет проходить через [main + style + arch]
+Тест автоматического пайплайна. Tree-sitter находит файлы, пайплайн запускается.
 
-🧠 [main~ + style + arch]> добавь валидацию входного параметра
-```
-
-Промпт изменился, агенты учитываются при каждом ответе.
-
-Выключить:
-```
-🧠 [main~ + style + arch]> /agent off
-🔕 Ambient агенты отключены
-🧠 [main~]>
-```
-
----
-
-## Шаг 12 — /review эфемерно
-
-```
-🧠 [main~]> /review @src/main.py
-```
-
-Одноразовая проверка файла через style-агент. Паттерн `main~` не должен измениться после этого.
-
----
-
-## Шаг 13 — git-хук (если установлен)
-
-```bash
-cd /path/to/my-project
-echo "# comment" >> src/main.py
-git add src/main.py
-git commit -m "add comment"
-```
-
-Должен запуститься post-commit хук:
-```
-[Cognit] Обновляю паттерны...
-   ~ main: grow-паттерн, пропускаем (накапливает диалог)
-[Cognit] Готово.
-```
-
-`main` имеет политику `grow` (feature-ветка) — пропускается. Если создать `retrain`-паттерн, он пересоздастся.
-
----
-
-## Шаг 14 — повторный запуск
-
-```bash
-# Ctrl+C или /exit
-python cognit.py
-```
-
-Паттерны уже есть — загрузка быстрая:
-```
-📋 Паттернов: 3  (style, arch, context)
-🧠> use main
-🧠 [main~]> продолжим — что ещё исправить?
-```
-
-Файл не перечитывается. Контекст персистентный.
-
----
-
-## Шаг 15 — Пайплайн (если есть RWKV)
-
-Тест автоматического пайплайна. RWKV запускается headless — пользователь его не видит.
-
-### Сценарий A: задача описана текстом — пайплайн запускается сам
+### Сценарий A: задача описана текстом
 
 ```bash
 python cognit.py
@@ -388,67 +227,53 @@ python cognit.py
 
 Ожидаем:
 ```
-⚙️  RWKV: навигирую...
-   → Файлы: src/main.py
-   → Мемо: hello() в main.py строки 1-3, нет зависимостей
+📇 Индекс: N файлов, M символов
+📍 Найдено X символов в Y файлах:
+   • main.py  (hello)
+
+   Запустить пайплайн? [Y/n]: y
 
 🚀 Пайплайн (5 стадий)
-  ✓ [rwkv  ] navigator
-  ✓ [agent ] context
-  ✓ [agent ] arch
-  ✓ [agent ] style
-  ✓ [coder ] coder
+  ✓ [nav   ] navigator
+
+  [agent] context
+  ...
+  [agent] arch
+  ...
+  [agent] style
+  ...
+  [coder] coder
   💡 Diff готов → /patch
-
-🧠 [_pipeline]>
-```
-
-```
-🧠 [_pipeline]> /patch
-✅ Патч применён → src/main.py
 ```
 
 **Что проверяем:**
-- RWKV запустился headless и завершился до отображения пайплайна
-- Каждая стадия отмечена `✓`
-- `_pipeline` паттерн — временный (retrain, будет сброшен при следующем пайплайне)
+- Tree-sitter нашёл файл с функцией
+- Каждый агент создаёт временный паттерн `_agent_<id>` (полный eval)
+- Агенты дают осмысленные мемо (не `<|im_end|>`)
+- Временные паттерны удалены после использования
 
-### Сценарий B: создать новый файл через пайплайн
+### Сценарий B: команда `route`
 
-```bash
-python cognit.py
-🧠> создать новый файл src/validators.py с функцией validate_email
+```
+🧠> route добавить валидацию email
 ```
 
-Ожидаем пайплайн, в конце diff с `--- /dev/null`, затем:
-```
-🧠 [_pipeline]> /patch
-НОВЫЙ ФАЙЛ: src/validators.py
-Создать? [y/N]: y
-✅ Файл создан → src/validators.py
-```
+Ожидаем: tree-sitter поиск → файлы → предложение запустить пайплайн.
 
 ### Сценарий C: pipeline.json — отключить стадию
 
-Редактируем `/path/to/my-project/pipeline.json`:
+Редактируем `pipeline.json`:
 ```json
 {
   "stages": [
-    {"id": "navigator", "type": "rwkv",  "enabled": true},
+    {"id": "navigator", "type": "navigator", "enabled": true},
     {"id": "context",   "type": "agent", "name": "context", "enabled": false},
-    {"id": "arch",      "type": "agent", "name": "arch",    "enabled": true},
-    {"id": "style",     "type": "agent", "name": "style",   "enabled": true},
-    {"id": "coder",     "type": "coder",                    "enabled": true}
+    ...
   ]
 }
 ```
 
-Запускаем задачу:
-```
-🧠> поправить что-нибудь
-```
-
-В выводе пайплайна: `context` помечен `✗`, остальные `✓`.
+В выводе пайплайна: `context` помечен `✗`, пропускается.
 
 ---
 
@@ -456,17 +281,21 @@ python cognit.py
 
 | Проверка | Критерий |
 |---|---|
-| Smoke | Однострочный баннер, модель загрузилась без ошибок |
+| Smoke | Модель загрузилась без ошибок |
 | card.md | Файлы `agents/*/card.md` созданы после первого запуска |
 | pipeline.json | Файл создан в клиентском проекте при `cognit_setup.py` |
 | grow ~ | `/list` — компактный формат, `~` для feature-паттернов |
 | /patch (правка) | `main.py` изменён, `.cognit.bak` создан |
 | /patch (новый файл) | `utils.py` создан, `.bak` не создаётся |
-| /edit | Файл читается свежим, diff генерируется без обращения к KV-cache |
+| /edit | Файл читается свежим, diff генерируется |
 | /agent | Промпт меняется, `/agent off` возвращает обычный |
-| Keyword agents | Вопрос про стиль → `🤖 Авто-агенты: style` без оркестратора |
-| Пайплайн headless | RWKV запускается/завершается без CLI → Transformer запускает стадии |
+| Keyword agents | Вопрос про стиль → `🤖 Авто-агенты: style` |
+| Tree-sitter навигация | Задача без паттерна → индекс находит файлы → пайплайн |
 | pipeline.json disable | Отключённая стадия → `✗` в выводе, пропускается |
+| /patch мульти-файл | Два diff-блока → два запроса подтверждения |
+| /patch путь | Относительный путь из diff → резолвится в `client_project` |
+| Совместимость модели | Паттерн от Q6_K + модель Q4_K_M → предупреждение |
 | Повторный запуск | Вопрос без перезагрузки файла работает |
 | post-commit хук | Grow-паттерн пропускается, retrain — пересоздаётся |
+| Пайплайн агенты | Каждый агент: save_pattern → ask_pattern → ответ (не `<\|im_end\|>`) |
 | Сброс | Удалить `echo_patterns/` → первый пайплайн пересоздаёт всё |

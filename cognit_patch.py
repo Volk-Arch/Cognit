@@ -25,6 +25,16 @@ def _extract_diff(text: str) -> str | None:
     return None
 
 
+def _extract_all_diffs(text: str) -> list[str]:
+    """Извлекает все unified diff блоки из ответа модели."""
+    diffs = re.findall(r'```diff\s*\n(.*?)```', text, re.DOTALL)
+    if diffs:
+        return [d.strip() for d in diffs if d.strip()]
+    # Fallback: один diff в сыром формате
+    single = _extract_diff(text)
+    return [single] if single else []
+
+
 def _diff_target(diff: str) -> str | None:
     """Извлекает путь целевого файла из заголовка +++ diff."""
     m = re.search(r'^\+\+\+[ \t]+(?:b/)?(.+?)(?:[ \t]+\d{4}|$)', diff, re.MULTILINE)

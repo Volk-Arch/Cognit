@@ -3,7 +3,7 @@
 # Copyright (c) 2026 Igor Kriusov <kriusovia@gmail.com>
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 """
-cognit_core.py — Общие утилиты для cognit_transformer.py и cognit_rwkv.py
+cognit_core.py — Общие утилиты для cognit_transformer.py
 =============================================================
 Не загружает никаких моделей. Чистые функции для работы с:
   - git-контекстом (repo, branch, путь к паттернам)
@@ -207,38 +207,6 @@ def load_last_route(patterns_dir: str) -> dict | None:
     except Exception:
         return None
 
-    return data
-
-
-# =============================================================================
-# EXPAND: ЗАПРОС TRANSFORMER → RWKV
-# =============================================================================
-def save_expand_request(patterns_dir: str, task: str, from_pattern: str, from_sources: list[str]):
-    """Сохраняет запрос Transformer к RWKV в _expand_last.json."""
-    expand_path = Path(patterns_dir) / "_expand_last.json"
-    with open(expand_path, "w", encoding="utf-8") as f:
-        json.dump({
-            "task":         task,
-            "from_pattern": from_pattern,
-            "from_sources": from_sources,
-            "requested_at": datetime.now().isoformat(),
-        }, f, ensure_ascii=False, indent=2)
-    return expand_path
-
-
-def load_expand_request(patterns_dir: str) -> dict | None:
-    """Читает _expand_last.json. Возвращает None если нет или старше 24 часов."""
-    expand_path = Path(patterns_dir) / "_expand_last.json"
-    if not expand_path.exists():
-        return None
-    with open(expand_path, encoding="utf-8") as f:
-        data = json.load(f)
-    try:
-        age_hours = (datetime.now() - datetime.fromisoformat(data["requested_at"])).total_seconds() / 3600
-        if age_hours > 24:
-            return None
-    except Exception:
-        return None
     return data
 
 

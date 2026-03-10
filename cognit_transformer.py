@@ -23,8 +23,7 @@ Cognit — Persistent Neural Context (Transformer)
     use <имя>                   — выбрать активный паттерн
     <вопрос>                    — задать вопрос (следует политике: grow/retrain)
     ? <вопрос>                  — временно сменить политику (grow↔retrain)
-    expand <задача>             — передать задачу в RWKV (handoff)
-    route <задача>              — найти файлы через RWKV-индекс → вернуться с файлами
+    route <задача>              — найти файлы через tree-sitter индекс → запустить пайплайн
     /load <имя> @<путь>          — загрузить файл/папку как паттерн
     /load <имя> @<д1> @<д2>     — composite: несколько источников, один eval-проход
     /load ?<имя> @<путь>         — загрузить с принудительным retrain
@@ -52,8 +51,10 @@ from pathlib import Path
 from datetime import datetime
 
 import cognit_core as core
-from cognit_patch import _extract_diff, _diff_target, apply_patch as _apply_patch
+from cognit_patch import (_extract_diff, _extract_all_diffs, _diff_target,
+                          _is_new_file_diff, apply_patch as _apply_patch)
 from cognit_agents import echo_config as _echo_config, list_agents as _list_agents, read_agent_text as _read_agent_text
+from cognit_index import CodeIndex
 
 # =============================================================================
 # КОНФИГУРАЦИЯ — читается из .echo.json (ключ "transformer"), defaults ниже
@@ -70,9 +71,13 @@ BRANCH_NAME  = core.git_branch()
 PATTERNS_DIR = core.make_patterns_dir(REPO_NAME, BRANCH_NAME)
 
 # Стоп-токены Qwen3 (ChatML)
-# </think> НЕ включаем: Qwen3 всегда выдаёт <think></think> перед ответом,
-# останавливаемся только когда ответ закончен
+# </think> НЕ включаем в основной список: Qwen3 выдаёт <think></think> перед ответом
 STOP_TOKENS = ["<|im_end|>", "<|im_start|>"]
+
+# Стоп-паттерны для ответа: модель начинает играть за других → стоп
+# Проверяются ТОЛЬКО после answer_started
+# </think> НЕ включаем: попадает в recent_text сразу после answer_started → ложный стоп
+ANSWER_STOP_PATTERNS = ["Human:", "User:", "\nHuman:", "\nUser:"]
 
 # =============================================================================
 # ИНИЦИАЛИЗАЦИЯ
@@ -161,8 +166,7 @@ def _context_prompt(text: str) -> str:
         "<|im_start|>system\n"
         "Ты — ассистент с предзагруженным контекстом. "
         "Отвечай на вопросы, опираясь на загруженный контекст. "
-        "Если информации в контексте недостаточно, предложи пользователю команду: "
-        "expand <краткое описание задачи> — это переключит на RWKV с доступом ко всей кодовой базе. "
+        "Если информации в контексте недостаточно, скажи об этом. "
         "/no_think\n"
         "<|im_end|>\n"
         "<|im_start|>user\n"
@@ -196,7 +200,7 @@ def save_pattern(name: str, text: str, source_files: list[str] = None, grow_poli
     print(f"\n📝 Формирование паттерна '{name}'  [{grow_policy}]...")
 
     prompt = _context_prompt(text)
-    tokens = llm.tokenize(prompt.encode("utf-8"))
+    tokens = llm.tokenize(prompt.encode("utf-8"), special=True)
 
     if len(tokens) > N_CTX - 64:
         print(f"⚠️  Текст слишком длинный ({len(tokens)} токенов), обрезаем до {N_CTX - 64}")
@@ -244,10 +248,24 @@ def load_pattern(name: str) -> bool:
         print(f"❌ Паттерн '{name}' не найден. Используйте 'list' для просмотра.")
         return False
 
+    # Проверка совместимости модели: KV-cache от другой квантизации = мусор
+    meta = core.read_meta(PATTERNS_DIR, name)
+    if meta and meta.get("model") and meta["model"] != MODEL_NAME:
+        print(f"⚠️  Паттерн '{name}' создан для {meta['model']}, "
+              f"текущая модель {MODEL_NAME}")
+        print(f"   Пересоздай: /load ?{name} @<путь>")
+        return False
+
     with open(pattern_path, "rb") as f:
         state = pickle.load(f)
 
     llm.load_state(state)
+
+    # load_state() восстанавливает KV-cache, но n_tokens (позиция записи)
+    # может не восстановиться — зависит от версии llama-cpp-python.
+    if meta and "n_tokens" in meta:
+        llm.n_tokens = meta["n_tokens"]
+
     return True
 
 
@@ -266,7 +284,8 @@ def ask_pattern(name: str, question: str, grow: bool = True) -> str:
 
     # Добавляем только вопрос — контекст уже в KV-cache
     question_prompt = _question_prompt(question)
-    q_tokens = llm.tokenize(question_prompt.encode("utf-8"), add_bos=False)
+    q_tokens = llm.tokenize(question_prompt.encode("utf-8"), add_bos=False, special=True)
+    print(f"(KV: {llm.n_tokens})", end="  ", flush=True)
 
     print(f"+{len(q_tokens)} tok")
     print(f"\n❓ {question}")
@@ -276,6 +295,8 @@ def ask_pattern(name: str, question: str, grow: bool = True) -> str:
     # Qwen3 выдаёт <think>...</think> перед ответом — скрываем этот блок
     collected = []
     answer_started = False
+    think_dots = 0  # счётчик точек-индикатора во время think-фазы
+    junk_streak = 0  # подряд идущие «мусорные» токены
 
     for token_id in llm.generate(q_tokens, reset=False, temp=0.3, top_p=0.9, repeat_penalty=1.1):
         piece = llm.detokenize([token_id]).decode("utf-8", errors="replace")
@@ -290,6 +311,9 @@ def ask_pattern(name: str, question: str, grow: bool = True) -> str:
 
         if not answer_started:
             if "</think>" in full:
+                # Стираем точки-индикатор
+                if think_dots:
+                    print("\r" + " " * (think_dots + 10) + "\r", end="", flush=True)
                 after = full.split("</think>", 1)[1]
                 for stop in STOP_TOKENS:
                     if stop in after:
@@ -297,6 +321,14 @@ def ask_pattern(name: str, question: str, grow: bool = True) -> str:
                 if after.strip():
                     print(after, end="", flush=True)
                 answer_started = True
+            elif not any(("<|im" in full, "<think>" in full)):
+                # Модель отвечает без <think> — выводим сразу
+                print(clean_piece, end="", flush=True)
+                answer_started = True
+            elif "<think>" in full and len(collected) % 12 == 0:
+                # Индикатор прогресса во время think-фазы
+                think_dots += 1
+                print(".", end="", flush=True)
         else:
             print(clean_piece, end="", flush=True)
 
@@ -305,13 +337,36 @@ def ask_pattern(name: str, question: str, grow: bool = True) -> str:
             break
         if len(collected) >= MAX_TOKENS:
             break
-        # Детектор зацикливания: последние 40 токенов == предыдущие 40
+        # Детектор фейковых turn'ов: модель начала играть за Human/User
+        if answer_started:
+            recent_text = "".join(collected[-10:])
+            if any(p in recent_text for p in ANSWER_STOP_PATTERNS):
+                print("\n⚠️  Фейковый turn — генерация остановлена")
+                break
+            # Детектор повторных code-блоков: второй ```diff/```python → стоп
+            fence_count = full.count("```")
+            if fence_count >= 4:  # 2 блока = 4 fence-маркера
+                print("\n⚠️  Повторный code-блок — генерация остановлена")
+                break
+        # Детектор зацикливания: точное совпадение 40 токенов
         if len(collected) >= 80:
             recent = "".join(collected[-40:])
             before = "".join(collected[-80:-40])
             if recent == before:
                 print("\n⚠️  Зацикливание — генерация остановлена")
                 break
+        # Детектор мусорных токенов: `, пробелы, \n подряд → стоп
+        if piece.strip("`\n\r \t") == "":
+            junk_streak += 1
+            if junk_streak >= 6:
+                print("\n⚠️  Мусорный вывод — генерация остановлена")
+                break
+        else:
+            junk_streak = 0
+
+    # Стираем точки если think не завершился
+    if think_dots and not answer_started:
+        print("\r" + " " * (think_dots + 10) + "\r", end="", flush=True)
 
     # Если модель ответила без think-блока — вывести всё
     if not answer_started:
@@ -345,10 +400,16 @@ def ask_pattern(name: str, question: str, grow: bool = True) -> str:
 
         print(f"💾 {name}  ({meta['size_kb']} KB, {meta['n_asks']}д)")
 
-    # Авто-детекция предложения expand от модели
+    # Очистка ответа: убираем think-блок и стоп-токены
     response = "".join(collected)
-    handoff = _maybe_expand(name, question, response)
-    return response, handoff  # tuple[str, dict | None]
+    if "</think>" in response:
+        response = response.split("</think>", 1)[1]
+    for stop in STOP_TOKENS + ANSWER_STOP_PATTERNS:
+        if stop in response:
+            response = response[:response.index(stop)]
+    response = response.strip()
+
+    return response
 
 
 def _save_current_kv(name: str):
@@ -371,7 +432,7 @@ def _save_current_kv(name: str):
 
 def _extract_line_range(memo: str, filename: str) -> tuple[int, int] | None:
     """
-    Парсит диапазон строк из RWKV мемо для конкретного файла.
+    Парсит диапазон строк из навигационного мемо для конкретного файла.
     Ищет паттерны: 'строки 42-67', 'lines 42-67', ':42-67'.
     Сначала ищет вблизи имени файла, потом по всему мемо.
     """
@@ -397,7 +458,7 @@ def _extract_line_range(memo: str, filename: str) -> tuple[int, int] | None:
 
 def _focused_file_content(filepath: str, memo: str, context_lines: int = 15) -> str:
     """
-    Возвращает сфокусированный фрагмент файла если в RWKV мемо есть номера строк.
+    Возвращает сфокусированный фрагмент файла если в навигационном мемо есть номера строк.
     Фрагмент = указанные строки ± context_lines, с номерами строк.
     Если номеров нет — полный файл до FILE_LIMIT символов.
     """
@@ -434,7 +495,7 @@ def _focused_file_content(filepath: str, memo: str, context_lines: int = 15) -> 
     return raw
 
 
-def _run_pipeline(task: str, files: list[str], rwkv_memo: str) -> str:
+def _run_pipeline(task: str, files: list[str], nav_memo: str = "") -> str:
     """
     Последовательный пайплайн агентов с накопленным контекстом.
 
@@ -445,6 +506,7 @@ def _run_pipeline(task: str, files: list[str], rwkv_memo: str) -> str:
     Лог рассуждений пишется в _pipeline_log.md клиентского проекта.
     Финальная стадия 'coder' генерирует unified diff.
 
+    nav_memo: контекстная заметка от tree-sitter навигатора (search_summary).
     Возвращает ответ кодера (diff).
     """
     from cognit_pipeline import load_pipeline, describe_pipeline
@@ -487,22 +549,22 @@ def _run_pipeline(task: str, files: list[str], rwkv_memo: str) -> str:
 
     for fpath in files:
         try:
-            content = _focused_file_content(fpath, rwkv_memo)
+            content = _focused_file_content(fpath, nav_memo)
             fname   = Path(fpath).name
             shared += f"## Файл: {fname}\n```\n{content}\n```\n\n"
             _log(f"Файл: {fname}", f"```\n{content}\n```")
         except Exception as e:
             print(f"   ⚠️  {fpath}: {e}")
 
-    # ── RWKV мемо — однократно в начале ─────────────────────────────────────
-    rwkv_stage = next((s for s in stages if s.get("type") == "rwkv"), None)
-    if rwkv_stage and rwkv_memo:
-        shared += f"## Навигация (RWKV)\n{rwkv_memo}\n\n"
-        _log("Навигация (RWKV)", rwkv_memo)
-        print(f"\n[rwkv] navigator")
-        print(f"   → {rwkv_memo[:120]}")
-    elif rwkv_stage:
-        print(f"\n[rwkv] navigator  — нет мемо (пропуск)")
+    # ── Навигация (tree-sitter) — однократно в начале ────────────────────────
+    nav_stage = next((s for s in stages if s.get("type") in ("navigator", "rwkv")), None)
+    if nav_stage and nav_memo:
+        shared += f"## Навигация\n{nav_memo}\n\n"
+        _log("Навигация", nav_memo)
+        print(f"\n[nav] navigator")
+        print(f"   → {nav_memo[:120]}")
+    elif nav_stage:
+        print(f"\n[nav] navigator  — нет мемо (пропуск)")
 
     # Только agent-стадии; coder — отдельно в конце
     agent_stages = [s for s in stages if s.get("type") == "agent"]
@@ -526,15 +588,32 @@ def _run_pipeline(task: str, files: list[str], rwkv_memo: str) -> str:
 
             print(f"\n[agent] {label}")
 
-            if not core.pattern_exists(PATTERNS_DIR, agent_name):
-                print(f"   ⚠️  Паттерн '{agent_name}' не найден — пропуск")
+            # Читаем текст агента из agents/<name>/
+            agent_text = _read_agent_text(agent_name)
+            if not agent_text:
+                print(f"   ⚠️  Агент '{agent_name}' — текст не найден — пропуск")
                 continue
 
-            memo = _chain_ask(agent_name, shared, role)
+            # Full eval: знания агента + shared контекст пайплайна
+            # (KV-cache continuation ломается на больших инжектах — save_pattern надёжен)
+            tmp_name = f"_agent_{sid}"
+            combined = f"## Знания агента: {agent_name}\n{agent_text}\n\n---\n\n{shared}"
+            save_pattern(tmp_name, combined, grow_policy="retrain")
+            memo_result = ask_pattern(tmp_name, role + "\n/no_think", grow=False)
+            memo = memo_result or ""
+
+            # Удаляем временный паттерн
+            for ext in (".pkl", ".json"):
+                p = Path(PATTERNS_DIR) / f"{tmp_name}{ext}"
+                if p.exists():
+                    p.unlink()
+
             if memo and memo.strip():
                 title = f"{sid}" + (f" · прогон {pass_num}" if passes > 1 else "")
                 shared += f"## {title}\n{memo.strip()}\n\n"
                 _log(title, memo.strip())
+            else:
+                print(f"   ⚠️  Агент '{agent_name}' не дал мемо — пропуск")
 
     # ── Кодер — финальная стадия ─────────────────────────────────────────────
     if coder_stage:
@@ -550,7 +629,7 @@ def _run_pipeline(task: str, files: list[str], rwkv_memo: str) -> str:
             f"Файлы: {file_names}\n\n"
             f"{role}"
         )
-        coder_response, _ = ask_pattern("_pipeline", coder_q, grow=False)
+        coder_response = ask_pattern("_pipeline", coder_q, grow=False)
 
         if coder_response:
             _log("Coder (diff)", coder_response)
@@ -575,8 +654,11 @@ def _peek_pattern(name: str, prompt: str) -> str | None:
         with open(pkl, "rb") as f:
             state = pickle.load(f)
         llm.load_state(state)
+        meta = core.read_meta(PATTERNS_DIR, name)
+        if meta and "n_tokens" in meta:
+            llm.n_tokens = meta["n_tokens"]
         # /no_think подавляет расширенный reasoning Qwen3 (экономит токены)
-        q_tokens = llm.tokenize(_question_prompt(prompt + "\n/no_think").encode("utf-8"), add_bos=False)
+        q_tokens = llm.tokenize(_question_prompt(prompt + "\n/no_think").encode("utf-8"), add_bos=False, special=True)
         collected = []
         for token_id in llm.generate(q_tokens, reset=False, temp=0.1, top_p=0.9):
             piece = llm.detokenize([token_id]).decode("utf-8", errors="replace")
@@ -599,58 +681,6 @@ def _peek_pattern(name: str, prompt: str) -> str | None:
 
 
 
-def _maybe_expand(pattern_name: str, question: str, response: str) -> dict | None:
-    """
-    Проверяет, предложила ли модель expand. Если да — предлагает запустить его.
-    Возвращает handoff dict или None.
-    """
-    lower = response.lower()
-    if "expand" not in lower:
-        return None
-
-    # Пробуем вытащить задачу из фразы вида "expand <задача>"
-    m = re.search(r'expand\s+([^\n`<]{5,150})', response, re.IGNORECASE)
-    if m:
-        suggested_task = m.group(1).strip().rstrip('.,!?`').strip()
-    else:
-        suggested_task = question
-
-    print(f"\n🔄 Expand → RWKV: «{suggested_task[:70]}»")
-    return _handoff_to_rwkv(pattern_name, suggested_task, original_question=question)
-
-
-def _maybe_route_suggestion(question: str, response: str) -> dict | None:
-    """
-    Проверяет, предложила ли модель route (нужны конкретные файлы).
-    Работает только если есть RWKV-индекс.
-    Возвращает expand_route handoff или None.
-    """
-    lower = response.lower()
-    if "route" not in lower:
-        return None
-
-    index = _find_rwkv_index()
-    if not index:
-        return None  # нет индекса — нечего предлагать
-
-    m = re.search(r'route\s+([^\n`<]{5,150})', response, re.IGNORECASE)
-    suggested_task = m.group(1).strip().rstrip('.,!?`').strip() if m else question
-
-    print(f"\n🗺  Route → RWKV: «{suggested_task[:70]}»")
-    return {"action": "expand_route", "task": suggested_task, "index": index,
-            "original_question": question}
-
-
-def _maybe_chain_handoff(active: str, question: str, response: str) -> dict | None:
-    """
-    После ответа агента проверяет: предложил ли он expand или route.
-    Возвращает первый найденный handoff или None.
-    Вызывается после _chain_ask чтобы цепочки агентов могли запускать переключение.
-    """
-    handoff = _maybe_expand(active, question, response)
-    if handoff:
-        return handoff
-    return _maybe_route_suggestion(question, response)
 
 
 def list_patterns():
@@ -691,45 +721,62 @@ def _find_or_load_agent(agent_name: str) -> str | None:
     return agent_name if core.pattern_exists(PATTERNS_DIR, agent_name) else None
 
 
-def _chain_ask(base_pattern: str, extra_text: str, question: str) -> str:
+def _chain_ask(base_pattern: str, extra_text: str, question: str,
+               no_think: bool = False) -> str:
     """
     Задаёт вопрос через KV-cache base_pattern с дополнительным контекстом.
-    extra_text и question объединяются в один ChatML user-message —
-    это критично для Qwen3: сырой текст между turns ломает ChatML и
-    вызывает немедленный <|im_end|> без ответа.
+
+    Стратегия двух turn'ов:
+      1) eval() — инжектируем extra_text как отдельный user→assistant turn
+      2) generate() — задаём question стандартным _question_prompt
+
+    Это повторяет проверенный путь save_pattern(eval) + ask_pattern(generate).
+    Один гигантский user-message ломал Qwen3: модель сразу выдавала <|im_end|>.
+
     Состояние НЕ сохраняется — эфемерная сессия (паттерн не меняется).
     """
     print(f"\n🔗 Цепочка: [{base_pattern}]")
     if not load_pattern(base_pattern):
         return ""
+    print(f"   KV-позиция: {llm.n_tokens} токенов")
 
-    # Единый ChatML user-message: контекст + вопрос вместе.
-    # Нельзя инжектировать extra_text как сырой текст после <|im_end|> —
-    # Qwen3 сразу ответит <|im_end|> из-за нарушения формата.
-    suffix   = f"\n\n{question}\n<|im_end|>\n<|im_start|>assistant\n"
-    prefix   = "<|im_start|>user\n"
-    body     = extra_text.strip()
+    # ── Шаг 1: инжектируем контекст как отдельный turn (eval, без генерации) ──
+    body = extra_text.strip()
+    if body:
+        inject = (
+            "<|im_start|>user\n"
+            f"{body}\n"
+            "<|im_end|>\n"
+            "<|im_start|>assistant\n"
+            "Контекст принят.\n"
+            "<|im_end|>\n"
+        )
+        inject_tokens = llm.tokenize(inject.encode("utf-8"), add_bos=False, special=True)
 
-    suffix_tokens = llm.tokenize(suffix.encode("utf-8"),  add_bos=False)
-    prefix_tokens = llm.tokenize(prefix.encode("utf-8"),  add_bos=False)
-    body_tokens   = llm.tokenize(body.encode("utf-8"),    add_bos=False)
+        max_inject = N_CTX - llm.n_tokens - 512  # оставляем место для вопроса + ответа
+        if len(inject_tokens) > max_inject:
+            print(f"⚠️  Контекст большой ({len(inject_tokens)} токенов), обрезаем до {max_inject}")
+            inject_tokens = inject_tokens[:max_inject]
 
-    max_body = N_CTX // 2 - len(prefix_tokens) - len(suffix_tokens)
-    if len(body_tokens) > max_body:
-        print(f"⚠️  Контент большой ({len(body_tokens)} токенов), обрезаем до {max_body}")
-        body_tokens = body_tokens[:max_body]
+        print(f"   Контекст: {len(inject_tokens)} токенов  "
+              f"(KV: {llm.n_tokens} + {len(inject_tokens)} = {llm.n_tokens + len(inject_tokens)} / {N_CTX})")
+        llm.eval(inject_tokens)
 
-    tokens = prefix_tokens + body_tokens + suffix_tokens
-    print(f"   Контент: {len(tokens)} токенов")
+    # ── Шаг 2: задаём вопрос стандартным путём (как ask_pattern) ──────────────
+    q = question + "\n/no_think" if no_think else question
+    q_prompt = _question_prompt(q)
+    q_tokens = llm.tokenize(q_prompt.encode("utf-8"), add_bos=False, special=True)
+
+    print(f"   Вопрос: +{len(q_tokens)} токенов")
     print(f"\n❓ {question}")
     print("─" * 50)
 
     collected = []
     answer_started = False
+    think_dots = 0
+    junk_streak = 0  # подряд идущие «мусорные» токены (только `, пробелы, \n)
 
-    # generate(tokens, reset=False): обрабатывает tokens как продолжение KV-state,
-    # затем генерирует ответ.
-    for token_id in llm.generate(tokens, reset=False, temp=0.3, top_p=0.9, repeat_penalty=1.1):
+    for token_id in llm.generate(q_tokens, reset=False, temp=0.3, top_p=0.9, repeat_penalty=1.1):
         piece = llm.detokenize([token_id]).decode("utf-8", errors="replace")
         collected.append(piece)
         full = "".join(collected)
@@ -741,6 +788,8 @@ def _chain_ask(base_pattern: str, extra_text: str, question: str) -> str:
 
         if not answer_started:
             if "</think>" in full:
+                if think_dots:
+                    print("\r" + " " * (think_dots + 10) + "\r", end="", flush=True)
                 after = full.split("</think>", 1)[1]
                 for stop in STOP_TOKENS:
                     if stop in after:
@@ -749,9 +798,11 @@ def _chain_ask(base_pattern: str, extra_text: str, question: str) -> str:
                     print(after, end="", flush=True)
                 answer_started = True
             elif not any(("<|im" in full, "<think>" in full)):
-                # /no_think: модель отвечает без <think> — выводим сразу
                 print(clean_piece, end="", flush=True)
                 answer_started = True
+            elif "<think>" in full and len(collected) % 12 == 0:
+                think_dots += 1
+                print(".", end="", flush=True)
         else:
             print(clean_piece, end="", flush=True)
 
@@ -760,12 +811,35 @@ def _chain_ask(base_pattern: str, extra_text: str, question: str) -> str:
             break
         if len(collected) >= MAX_TOKENS:
             break
+        # Детектор фейковых turn'ов: модель начала играть за Human/User
+        if answer_started:
+            recent_text = "".join(collected[-10:])
+            if any(p in recent_text for p in ANSWER_STOP_PATTERNS):
+                print("\n⚠️  Фейковый turn — генерация остановлена")
+                break
+            # Детектор повторных code-блоков: второй ```diff/```python → стоп
+            fence_count = full.count("```")
+            if fence_count >= 4:  # 2 блока = 4 fence-маркера
+                print("\n⚠️  Повторный code-блок — генерация остановлена")
+                break
+        # Детектор зацикливания: точное совпадение 40 токенов
         if len(collected) >= 80:
             recent = "".join(collected[-40:])
             before = "".join(collected[-80:-40])
             if recent == before:
                 print("\n⚠️  Зацикливание — генерация остановлена")
                 break
+        # Детектор мусорных токенов: `, пробелы, \n подряд → стоп
+        if piece.strip("`\n\r \t") == "":
+            junk_streak += 1
+            if junk_streak >= 6:
+                print("\n⚠️  Мусорный вывод — генерация остановлена")
+                break
+        else:
+            junk_streak = 0
+
+    if think_dots and not answer_started:
+        print("\r" + " " * (think_dots + 10) + "\r", end="", flush=True)
 
     if not answer_started:
         print("".join(collected), end="", flush=True)
@@ -774,13 +848,15 @@ def _chain_ask(base_pattern: str, extra_text: str, question: str) -> str:
     print("   🔗 Цепочка завершена — паттерн не изменён")
 
     response = "".join(collected)
-    # Убираем думательный блок если есть
     if "</think>" in response:
         response = response.split("</think>", 1)[1]
-    for stop in STOP_TOKENS:
+    for stop in STOP_TOKENS + ANSWER_STOP_PATTERNS:
         if stop in response:
             response = response[:response.index(stop)]
-    return response.strip()
+    result = response.strip()
+    if not result:
+        print("   ⚠️  Агент промолчал (пустой ответ)")
+    return result
 
 
 def _do_edit(file_path: str, task: str, base_pattern: str | None = None) -> str:
@@ -827,7 +903,7 @@ def _do_edit(file_path: str, task: str, base_pattern: str | None = None) -> str:
         # Нет активного паттерна — временный из самого файла (не сохраняется)
         _EDIT_TMP = "_edit_tmp"
         _load_path(_EDIT_TMP, file_path)
-        resp, _ = ask_pattern(_EDIT_TMP, edit_question, grow=False)
+        resp = ask_pattern(_EDIT_TMP, edit_question, grow=False)
         return resp or ""
 
 
@@ -839,8 +915,7 @@ HELP = """
   use <имя>            — выбрать активный паттерн (память модели)
   <вопрос>             — спросить  (следует политике паттерна: grow сохраняет, retrain — нет)
   ? <вопрос>           — спросить с временной сменой политики (grow↔retrain)
-  expand <задача>      — передать задачу в RWKV и выгрузиться
-  route <задача>       — найти файлы через RWKV-индекс → вернуться с файлами
+  route <задача>       — найти файлы через tree-sitter индекс → запустить пайплайн
   /load <имя> @<файл>        — загрузить файл как паттерн
   /load <имя> @<д1> @<д2>   — composite: несколько папок в одном eval-проходе
   /load <имя> <текст>        — загрузить текст как паттерн
@@ -867,8 +942,7 @@ HELP = """
   /review @src/auth.py                ← ревью файла (стиль + код)
   /edit @src/auth.py исправь JWT      ← читает файл свежо → точный diff
   /patch                              ← применяем diff к auth.py
-  expand нужен контекст по auth       ← передать задачу в RWKV (обзор)
-  route добавить rate limiting        ← найти нужные файлы через RWKV-индекс
+  route добавить rate limiting        ← найти нужные файлы → пайплайн
 """
 
 
@@ -1019,79 +1093,74 @@ def _suggest_agents(question: str) -> list[str]:
 
 
 
-def _find_rwkv_index() -> str | None:
+def _get_code_index() -> CodeIndex | None:
+    """Возвращает CodeIndex для клиентского проекта (кеширует)."""
+    cfg = _echo_config()
+    client_dir = cfg.get("client_project", "")
+    if not client_dir or not Path(client_dir).exists():
+        return None
+    idx = CodeIndex(client_dir, cache_dir=PATTERNS_DIR)
+    idx.build()
+    return idx
+
+
+def _route_via_index(task: str) -> tuple[list[str], str]:
     """
-    Ищет любой RWKV-паттерн в PATTERNS_DIR.
-    Возвращает имя первого найденного или None.
+    Находит релевантные файлы для задачи через tree-sitter индекс.
+
+    1. CodeIndex.search(task) → кандидаты (файлы + символы)
+    2. Формирует контекстную заметку (какие символы нашлись)
+    3. Возвращает (files, context_note)
+
+    Без переключения моделей — всё in-process.
     """
-    for meta_path in sorted(Path(PATTERNS_DIR).glob("*.json")):
-        try:
-            with open(meta_path, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-            if meta.get("backend") == "rwkv":
-                return meta["name"]
-        except Exception:
-            pass
-    return None
+    idx = _get_code_index()
+    if idx is None:
+        print("⚠️  client_project не задан в .echo.json — маршрутизация невозможна")
+        return [], ""
+
+    # Поиск по индексу
+    results = idx.search(task, top_k=15)
+    if not results:
+        print("⚠️  Индекс не нашёл релевантных символов")
+        return [], ""
+
+    # Уникальные файлы (по порядку score)
+    seen: set[str] = set()
+    files: list[str] = []
+    for r in results:
+        if r.filepath not in seen:
+            seen.add(r.filepath)
+            files.append(r.filepath)
+
+    # Контекстная заметка для пайплайна
+    context_note = idx.search_summary(task, top_k=10)
+
+    # Показываем что нашли
+    print(f"\n📍 Найдено {len(results)} символов в {len(files)} файлах:")
+    for f in files:
+        rel = f.replace(idx.project_dir, "").lstrip("/\\")
+        file_results = [r for r in results if r.filepath == f]
+        symbols_str = ", ".join(r.symbol.name for r in file_results[:3])
+        print(f"   • {rel}  ({symbols_str})")
+
+    return files, context_note
 
 
-def _handoff_to_rwkv(active: str, task: str, original_question: str = "") -> dict:
-    """Передаёт задачу в RWKV. Возвращает dict для in-process switch через оркестратор."""
-    meta = core.read_meta(PATTERNS_DIR, active) if active else {}
-    sources = [s["path"] for s in meta.get("source_files", [])]
-    core.save_expand_request(PATTERNS_DIR, task, active or "", sources)
-    return {
-        "action":            "expand",
-        "task":              task,
-        "original_question": original_question,
-        "from_pattern":      active or "",
-        "from_sources":      sources,
-        "requested_at":      datetime.now().isoformat(),
-    }
-
-
-def cli_loop(auto_route: bool = False, pending: dict = None) -> dict | None:
+def cli_loop() -> None:
     """
     Главный интерактивный цикл.
-    Возвращает dict handoff (action=expand) или None при /exit.
-    При запуске через когнит.py — используется pending для авто-маршрута.
+    Возвращает None при /exit.
     """
     print(f"\n🧠 Transformer · {MODEL_NAME[:28]} · {REPO_NAME}/{BRANCH_NAME}")
 
     list_patterns()
     _auto_init_agents()
 
-    # Если RWKV оставил маршрут — запускаем пайплайн агентов
     active = None
     active_policy = None
     last_response = ""
     ambient_agents = []  # список агентов для ambient-режима ([] = выключен)
-    route = pending if (pending and pending.get("action") == "route") else core.load_last_route(PATTERNS_DIR)
-    if route:
-        age_min = int((datetime.now() - datetime.fromisoformat(route["routed_at"])).total_seconds() / 60)
-        task     = route.get("original_question") or route.get("task", "")
-        files    = [f for f in route.get("files", []) if os.path.exists(f)]
-        rwkv_memo = route.get("context_note", "")
-
-        print(f"\n💡 Маршрут от RWKV ({age_min} мин назад): «{task}»")
-        print(f"   Файлов: {len(files)}")
-        for f in files:
-            print(f"   • {f}")
-        if rwkv_memo:
-            print(f"   🗺 {rwkv_memo[:120]}")
-
-        if not auto_route:
-            try:
-                ans = input("\n   Запустить пайплайн? [Y/n] ").strip().lower()
-            except (KeyboardInterrupt, EOFError):
-                ans = "n"
-            if ans == "n":
-                files = []  # отменяем
-
-        if files:
-            last_response = _run_pipeline(task, files, rwkv_memo)
-            active        = "_pipeline"
-            active_policy = "retrain"
 
     if not active:
         print("\n💡 Введи вопрос или задачу — Cognit найдёт нужные файлы автоматически.")
@@ -1166,44 +1235,56 @@ def cli_loop(auto_route: bool = False, pending: dict = None) -> dict | None:
                     if not active:
                         print("❌ Сначала выбери паттерн: use <имя>")
                         continue
-                    diff = _extract_diff(last_response) if last_response else None
-                    if not diff:
+                    diffs = _extract_all_diffs(last_response) if last_response else []
+                    if not diffs:
                         if not last_response:
                             print("❌ Нет предыдущего ответа. Задай вопрос об изменениях, затем /patch.")
                             continue
-                        # Diff не найден — инжектируем предыдущий ответ как контекст и просим diff
                         print("   Diff не найден — переформатирую предыдущий ответ...")
                         last_response = _chain_ask(
                             active,
                             f"Предыдущий ответ:\n\n{last_response}",
                             "Покажи изменения из этого ответа в виде unified diff (```diff блок).",
                         )
-                        diff = _extract_diff(last_response)
-                    if not diff:
+                        diffs = _extract_all_diffs(last_response)
+                    if not diffs:
                         print("❌ Модель не вернула unified diff. Попроси явно.")
                         continue
-                    # Файл: из аргумента /patch @file, или из заголовка +++ diff
-                    target = parts[1].lstrip("@") if len(parts) > 1 else _diff_target(diff)
-                    if not target:
-                        print("❌ Файл не определён. Используй: /patch @<файл>")
-                        continue
-                    is_new = not os.path.exists(target)
-                    preview = diff.split('\n')
-                    label = "НОВЫЙ ФАЙЛ" if is_new else target
-                    print(f"\n📋 Diff ({len(preview)} строк)  →  {label}")
-                    print("─" * 60)
-                    for ln in preview[:50]:
-                        print(ln)
-                    if len(preview) > 50:
-                        print(f"   ... (ещё {len(preview) - 50} строк)")
-                    print("─" * 60)
-                    try:
-                        action = "Создать" if is_new else "Применить"
-                        ans = input(f"   {action} '{target}'? [y/N] ").strip().lower()
-                    except (KeyboardInterrupt, EOFError):
-                        continue
-                    if ans == "y":
-                        _apply_patch(diff, target)
+
+                    # Resolve paths relative to client_project
+                    cfg_patch = _echo_config()
+                    client_dir_patch = cfg_patch.get("client_project", "")
+                    # Explicit @file override (only for single diff)
+                    explicit_target = parts[1].lstrip("@") if len(parts) > 1 else None
+
+                    if len(diffs) > 1:
+                        print(f"\n📋 Найдено {len(diffs)} diff-блоков")
+
+                    for diff in diffs:
+                        target = explicit_target or _diff_target(diff)
+                        if not target:
+                            print("❌ Файл не определён. Используй: /patch @<файл>")
+                            continue
+                        # Resolve relative paths against client_project
+                        if not os.path.isabs(target) and not os.path.exists(target) and client_dir_patch:
+                            target = os.path.join(client_dir_patch, target)
+                        is_new = _is_new_file_diff(diff) or not os.path.exists(target)
+                        preview = diff.split('\n')
+                        label = "НОВЫЙ ФАЙЛ" if is_new else target
+                        print(f"\n📋 Diff ({len(preview)} строк)  →  {label}")
+                        print("─" * 60)
+                        for ln in preview[:50]:
+                            print(ln)
+                        if len(preview) > 50:
+                            print(f"   ... (ещё {len(preview) - 50} строк)")
+                        print("─" * 60)
+                        try:
+                            action = "Создать" if is_new else "Применить"
+                            ans = input(f"   {action} '{target}'? [y/N] ").strip().lower()
+                        except (KeyboardInterrupt, EOFError):
+                            continue
+                        if ans == "y":
+                            _apply_patch(diff, target)
 
                 elif cmd == "agents":
                     agents = _list_agents(PATTERNS_DIR)
@@ -1281,9 +1362,6 @@ def cli_loop(auto_route: bool = False, pending: dict = None) -> dict | None:
                     agent = _find_or_load_agent(agent_name)
                     if agent:
                         last_response = _chain_ask(agent, content, question)
-                        handoff = _maybe_chain_handoff(active or agent, question, last_response)
-                        if handoff:
-                            return handoff
 
                 else:
                     print(f"❌ Неизвестная команда '/{cmd}'. Введите '/help'.")
@@ -1324,45 +1402,48 @@ def cli_loop(auto_route: bool = False, pending: dict = None) -> dict | None:
                     if agent_text:
                         last_response = _chain_ask(active, agent_text, question)
                     else:
-                        last_response, _ = ask_pattern(active, question, grow=False)
+                        last_response = ask_pattern(active, question, grow=False)
                 else:
                     # ? флипает политику: grow→не сохранять, retrain→сохранять
                     flipped_grow = (active_policy == "retrain")
-                    last_response, _ = ask_pattern(active, question, grow=flipped_grow)
+                    last_response = ask_pattern(active, question, grow=flipped_grow)
 
-            # ── expand <задача> → handoff to RWKV ───────────────────────────
-            elif user_input.lower().startswith("expand ") or user_input.lower() == "expand":
-                task = user_input[7:].strip()
-                if not task:
-                    print("❌ Использование: expand <задача>")
-                    print("   Пример: expand нужен контекст по модулю авторизации")
-                    continue
-                return _handoff_to_rwkv(active, task)
-
-            # ── route <задача> → авто-маршрут через RWKV-индекс ─────────────
+            # ── route <задача> → найти файлы через tree-sitter индекс ───────
             elif user_input.lower().startswith("route ") or user_input.lower() == "route":
                 task = user_input[6:].strip()
                 if not task:
                     print("❌ Использование: route <задача>")
                     print("   Пример: route добавить rate limiting для POST /login")
                     continue
-                index = _find_rwkv_index()
-                if not index:
-                    # Индекса нет — падаём на expand (сам построит индекс)
-                    return _handoff_to_rwkv(active, task, original_question=user_input)
-                print(f"   Найден RWKV-индекс: {index}")
-                return {
-                    "action": "expand_route",
-                    "task":   task,
-                    "index":  index,
-                    "original_question": user_input,
-                }
+                files, nav_memo = _route_via_index(task)
+                if files:
+                    try:
+                        ans = input("\n   Запустить пайплайн? [Y/n] ").strip().lower()
+                    except (KeyboardInterrupt, EOFError):
+                        ans = "n"
+                    if ans != "n":
+                        last_response = _run_pipeline(task, files, nav_memo)
+                        active = "_pipeline"
+                        active_policy = "retrain"
 
             # ── просто текст → ask ───────────────────────────────────────────
             else:
                 if not active:
-                    # Нет паттерна — авто-маршрутизируем через RWKV
-                    return _handoff_to_rwkv(None, user_input, original_question=user_input)
+                    # Нет паттерна — авто-маршрутизируем через tree-sitter индекс
+                    files, nav_memo = _route_via_index(user_input)
+                    if files:
+                        try:
+                            ans = input("\n   Запустить пайплайн? [Y/n] ").strip().lower()
+                        except (KeyboardInterrupt, EOFError):
+                            ans = "n"
+                        if ans != "n":
+                            last_response = _run_pipeline(user_input, files, nav_memo)
+                            active = "_pipeline"
+                            active_policy = "retrain"
+                    else:
+                        print("❌ Не удалось найти файлы. Загрузи вручную: /load <имя> @<путь>")
+                    continue
+
                 effective_agents = ambient_agents or _suggest_agents(user_input)
                 if effective_agents:
                     if not ambient_agents:
@@ -1374,10 +1455,10 @@ def cli_loop(auto_route: bool = False, pending: dict = None) -> dict | None:
                         last_response = _chain_ask(active, agent_text, user_input)
                         _save_current_kv(active)
                     else:
-                        last_response, _ = ask_pattern(active, user_input, grow=(active_policy == "grow"))
+                        last_response = ask_pattern(active, user_input, grow=(active_policy == "grow"))
                 else:
                     # Следуем политике паттерна: grow сохраняет, retrain — нет
-                    last_response, _ = ask_pattern(active, user_input, grow=(active_policy == "grow"))
+                    last_response = ask_pattern(active, user_input, grow=(active_policy == "grow"))
 
                 # После любого ask: если в ответе есть код — подсказываем /patch
                 if last_response and "```" in last_response:
