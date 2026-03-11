@@ -315,13 +315,26 @@ def ask_pattern(name: str, question: str, grow: bool = True) -> str:
             if fence_count >= 4:  # 2 блока = 4 fence-маркера
                 print("\n⚠️  Повторный code-блок — генерация остановлена")
                 break
-        # Детектор зацикливания: точное совпадение 40 токенов
-        if len(collected) >= 80:
-            recent = "".join(collected[-40:])
-            before = "".join(collected[-80:-40])
-            if recent == before:
-                print("\n⚠️  Зацикливание — генерация остановлена")
-                break
+        # Детектор зацикливания: несколько размеров окна
+        _loop_found = False
+        for win in (30, 60, 90):
+            if len(collected) >= win * 2:
+                recent = "".join(collected[-win:])
+                before = "".join(collected[-win * 2:-win])
+                if recent == before:
+                    _loop_found = True
+                    break
+        if _loop_found:
+            if not answer_started and think_dots:
+                print("\r" + " " * (think_dots + 10) + "\r", end="", flush=True)
+            print("\n⚠️  Зацикливание — генерация остановлена")
+            break
+        # Лимит think-фазы: >400 токенов без </think> → стоп
+        if not answer_started and len(collected) > 400:
+            if think_dots:
+                print("\r" + " " * (think_dots + 10) + "\r", end="", flush=True)
+            print("⚠️  Think-фаза слишком длинная — генерация остановлена")
+            break
         # Детектор мусорных токенов: `, пробелы, \n подряд → стоп
         if piece.strip("`\n\r \t") == "":
             junk_streak += 1
@@ -515,9 +528,10 @@ def _run_pipeline(task: str, files: list[str], nav_memo: str = "") -> str:
     elif nav_stage:
         print(f"\n[nav] navigator  — нет мемо (пропуск)")
 
-    # Только agent-стадии; coder — отдельно в конце
-    agent_stages = [s for s in stages if s.get("type") == "agent"]
-    coder_stage  = next((s for s in stages if s.get("type") == "coder"), None)
+    # Только agent-стадии; coder и reviewer — отдельно в конце
+    agent_stages   = [s for s in stages if s.get("type") == "agent"]
+    coder_stage    = next((s for s in stages if s.get("type") == "coder"), None)
+    reviewer_stage = next((s for s in stages if s.get("type") == "reviewer"), None)
 
     # ── Прогоны агентов (passes раз) ─────────────────────────────────────────
     coder_response = ""
@@ -582,8 +596,53 @@ def _run_pipeline(task: str, files: list[str], nav_memo: str = "") -> str:
 
         if coder_response:
             _log("Coder (diff)", coder_response)
-            if "```" in coder_response:
-                print("\n💡 Diff готов → /patch")
+
+    # ── Ревьюер — проверка diff по tree-sitter ────────────────────────────────
+    if reviewer_stage and coder_response and "```" in coder_response:
+        from cognit_patch import _extract_all_diffs, _diff_target
+
+        role = reviewer_stage.get("role", "").replace("{task}", task)
+        print(f"\n[reviewer] reviewer")
+
+        # Tree-sitter структура затронутых файлов
+        tree_info = ""
+        if _HAS_INDEX:
+            idx = _get_code_index()
+            if idx:
+                diffs = _extract_all_diffs(coder_response)
+                for d in diffs:
+                    target = _diff_target(d)
+                    if target:
+                        abs_target = target
+                        if not os.path.isabs(target) and client_dir:
+                            abs_target = os.path.join(client_dir, target)
+                        tree_info += idx.file_summary(abs_target) + "\n\n"
+
+        # Контекст ревьюера: задача + исходные файлы + diff + tree
+        review_ctx = f"## Задача\n{task}\n\n"
+        for fpath in files:
+            try:
+                content = Path(fpath).read_text(encoding="utf-8", errors="ignore")[:6000]
+                review_ctx += f"## Файл: {Path(fpath).name}\n```\n{content}\n```\n\n"
+            except Exception:
+                pass
+        review_ctx += f"## Diff от кодера\n```diff\n{coder_response}\n```\n\n"
+        if tree_info:
+            review_ctx += f"## Структура файлов (tree-sitter)\n{tree_info}\n"
+
+        save_pattern("_pipeline", review_ctx, grow_policy="retrain")
+        reviewed = ask_pattern("_pipeline", role + "\n/no_think", grow=False)
+
+        if reviewed and "```" in reviewed:
+            coder_response = reviewed
+            _log("Reviewer (исправлен)", reviewed)
+            print("   ✓ Diff скорректирован")
+        else:
+            _log("Reviewer (без изменений)", reviewed or "(нет ответа)")
+            print("   ✓ Diff без изменений")
+
+    if coder_response and "```" in coder_response:
+        print("\n💡 Diff готов → /patch")
 
     if log_path and log_path.exists():
         print(f"\n📄 Лог: {log_path}")
@@ -1037,6 +1096,7 @@ def cli_loop() -> None:
                     if len(diffs) > 1:
                         print(f"\n📋 Найдено {len(diffs)} diff-блоков")
 
+                    applied_any = False
                     for diff in diffs:
                         target = explicit_target or _diff_target(diff)
                         if not target:
@@ -1062,6 +1122,13 @@ def cli_loop() -> None:
                             continue
                         if ans == "y":
                             _apply_patch(diff, target)
+                            applied_any = True
+
+                    # После /patch в пайплайне — сбросить контекст кодера
+                    if applied_any and active == "_pipeline":
+                        active = None
+                        active_policy = None
+                        print("🔄 Пайплайн завершён, контекст сброшен.")
 
                 elif cmd == "agents":
                     agents = _list_agents(PATTERNS_DIR)
