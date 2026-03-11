@@ -553,14 +553,15 @@ def _run_pipeline(task: str, files: list[str], nav_memo: str = "") -> str:
 
             # Читаем текст агента из agents/<name>/
             agent_text = _read_agent_text(agent_name)
-            if not agent_text:
-                print(f"   ⚠️  Агент '{agent_name}' — текст не найден — пропуск")
-                continue
 
             # Full eval: знания агента + shared контекст пайплайна
+            # Агент без текста (например analyst) работает только с shared context + role
             # (KV-cache continuation ломается на больших инжектах — save_pattern надёжен)
             tmp_name = f"_agent_{sid}"
-            combined = f"## Знания агента: {agent_name}\n{agent_text}\n\n---\n\n{shared}"
+            if agent_text:
+                combined = f"## Знания агента: {agent_name}\n{agent_text}\n\n---\n\n{shared}"
+            else:
+                combined = shared
             save_pattern(tmp_name, combined, grow_policy="retrain")
             memo_result = ask_pattern(tmp_name, role + "\n/no_think", grow=False)
             memo = memo_result or ""

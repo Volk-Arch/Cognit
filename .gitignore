@@ -16,8 +16,11 @@ __pycache__/
 .echo.json
 
 
+# Локальные заметки
+TODO.local.md
+CLAUDE.md
+
 # IDE
 .claude/
 .idea/
 .venv/
-# Cognit — паттерны не версионируются, хранятся локально или в S3
