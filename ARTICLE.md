@@ -1,166 +1,168 @@
-# ИИ с памятью: как маленькая модель работает с большим проектом
+# AI with Memory: How a Small Model Works with a Large Project
 
-*Почему 8-миллиардная модель не может удержать в голове весь проект — и как пайплайн с дистилляцией контекста это обходит*
+[🇷🇺 Русская версия](ARTICLE.ru.md)
 
----
-
-## Проблема, которую все игнорируют
-
-Когда вы открываете новый чат с ИИ-ассистентом, он ничего о вас не знает. Вы снова объясняете контекст, снова вставляете код, снова напоминаете, как устроен проект. Это раздражает — но большинство воспринимает это как данность.
-
-У этой проблемы есть точная аналогия. Представьте коллегу, который каждое утро приходит с полностью стёртой памятью. Блестящий специалист, схватывает всё на лету — но вчерашний разговор не помнит. Каждый день вы тратите первый час, вводя его в контекст заново.
-
-Облачные модели (GPT-4, Claude) решают это грубой силой — контекст 128K токенов, просто вставляй всё. Но если вы работаете с **локальной** моделью на своей видеокарте — контекст ограничен. Qwen3-8B видит ~8000 токенов за раз. Это 300-400 строк кода. Один файл — и места на ответ уже не остаётся.
+*Why an 8-billion-parameter model can't hold an entire project in its head — and how a pipeline with context distillation works around it*
 
 ---
 
-## Наивный подход: запихнуть всё в контекст
+## The Problem Everyone Ignores
 
-Допустим, модель должна поправить функцию. Чтобы сделать это качественно, ей нужно знать:
-- сам файл с кодом (~3000 токенов)
-- соглашения по стилю (~800 токенов)
-- архитектурные ограничения (~600 токенов)
-- контекст проекта (~500 токенов)
-- задачу (~50 токенов)
+When you open a new chat with an AI assistant, it knows nothing about you. You explain the context again, paste the code again, remind it how the project is structured again. It's frustrating — but most people accept it as a given.
 
-Итого: **~4950 токенов** на входе. Из 8192 осталось ~3200 на ответ — впритык для diff, и модель начинает обрезать или терять нить.
+There's an exact analogy for this problem. Imagine a colleague who comes in every morning with a completely wiped memory. A brilliant specialist who picks things up instantly — but doesn't remember yesterday's conversation. Every day you spend the first hour bringing them up to speed all over again.
 
-Можно выбросить соглашения — но тогда модель нарушит стиль. Можно выбросить архитектуру — но тогда она сломает зависимости. Классический компромисс: **больше знаний на входе — меньше места на ответ**.
+Cloud models (GPT-4, Claude) solve this with brute force — 128K token context, just paste everything in. But if you work with a **local** model on your own GPU — context is limited. Qwen3-8B sees ~8000 tokens at a time. That's 300-400 lines of code. One file — and there's no room left for the response.
 
 ---
 
-## Идея: пусть каждый «эксперт» прочитает своё и скажет главное
+## The Naive Approach: Stuff Everything into Context
 
-Вместо того чтобы запихивать всё в один запрос, мы делаем несколько отдельных проходов. Каждый агент получает файл + свои знания и **сжимает** их до короткого мемо — 2-4 предложения.
+Say the model needs to fix a function. To do this well, it needs to know:
+- the code file itself (~3000 tokens)
+- style conventions (~800 tokens)
+- architectural constraints (~600 tokens)
+- project context (~500 tokens)
+- the task (~50 tokens)
 
-Кодер в конце получает файл + сфокусированные мемо вместо всех исходных документов:
+Total: **~4950 tokens** on input. Out of 8192, about ~3200 remain for the response — barely enough for a diff, and the model starts truncating or losing its train of thought.
+
+You could drop the conventions — but then the model will violate the style. You could drop the architecture — but then it'll break dependencies. A classic trade-off: **more knowledge on input — less room for the response**.
+
+---
+
+## The Idea: Let Each "Expert" Read Its Part and Report the Essentials
+
+Instead of stuffing everything into one request, we make several separate passes. Each agent receives a file + its own knowledge and **compresses** it into a short memo — 2-4 sentences.
+
+The coder at the end receives the file + focused memos instead of all the source documents:
 
 ```
-Задача: «поправить функцию bayes_update»
+Task: "fix the bayes_update function"
   │
-  ├─ [1] Navigator        → «bayes_update() строки 42-67, зависит от validate_input()»
+  ├─ [1] Navigator        → "bayes_update() lines 42-67, depends on validate_input()"
   │
-  ├─ [2] analyst          → «заменить X на Y в строке 45, добавить валидацию в Z»
-  │       (анализирует код + задачу → конкретный план)
+  ├─ [2] analyst          → "replace X with Y at line 45, add validation at Z"
+  │       (analyzes code + task → specific plan)
   │
-  ├─ [3] context agent    → «цель проекта — демо байесовских методов»
-  │       (знания из agents/context/)
+  ├─ [3] context agent    → "project goal — demo of Bayesian methods"
+  │       (knowledge from agents/context/)
   │
-  ├─ [4] arch agent       → «не нарушать сигнатуру float→float, зависимости X→Y»
-  │       (знания из agents/arch/)
+  ├─ [4] arch agent       → "don't break the float→float signature, dependencies X→Y"
+  │       (knowledge from agents/arch/)
   │
-  ├─ [5] style agent      → «snake_case, type hints обязательны, docstring»
-  │       (знания из agents/style/)
+  ├─ [5] style agent      → "snake_case, type hints required, docstring"
+  │       (knowledge from agents/style/)
   │
-  ├─ [6] coder            → unified diff по плану аналитика + ограничениям агентов
+  ├─ [6] coder            → unified diff following the analyst's plan + agent constraints
   │
-  └─ [7] reviewer         → проверяет diff по структуре кода
-              │
-              ▼
-           /patch → файл обновлён
+  └─ [7] reviewer         → validates diff against code structure
+            │
+            ▼
+         /patch → file updated
 ```
 
-**Арифметика:**
+**The Math:**
 
-Каждый агент работает в изолированном eval-проходе и видит полный контекст своих знаний. Но на выходе — мемо в ~80 токенов. Аналитик + три агента → 320 токенов вместо 1900. Кодер получает:
+Each agent works in an isolated eval pass and sees the full context of its knowledge. But the output is a memo of ~80 tokens. Analyst + three agents → 320 tokens instead of 1900. The coder receives:
 
 ```
-файл 3000 + 4 мемо 320 + задача 50 = 3370 токенов → ~4800 на ответ
+file 3000 + 4 memos 320 + task 50 = 3370 tokens → ~4800 for the response
 ```
 
-Вместо 3200 — **4800 токенов** для генерации кода. Модель получает те же знания, но сжатые — и у неё остаётся запас для полноценного diff. Ключевое: аналитик даёт кодеру **конкретный план** что менять, а не просто ограничения.
+Instead of 3200 — **4800 tokens** for code generation. The model gets the same knowledge, but compressed — and has headroom for a full diff. The key point: the analyst gives the coder a **specific plan** of what to change, not just constraints.
 
-Это не RAG (retrieval-augmented generation) — модель не ищет по векторной базе. Это **дистилляция контекста**: каждый агент перерабатывает свои знания в сфокусированную подсказку для кодера.
+This is not RAG (retrieval-augmented generation) — the model doesn't search a vector database. This is **context distillation**: each agent processes its knowledge into a focused hint for the coder.
 
 ---
 
-## Как модель находит нужные файлы
+## How the Model Finds the Right Files
 
-Когда пользователь пишет «поправить функцию bayes_update», система должна понять, в каком файле эта функция и какие файлы рядом. Для этого используется tree-sitter — парсер, который строит синтаксическое дерево для каждого Python-файла в проекте.
+When a user types "fix the bayes_update function," the system needs to figure out which file contains that function and what other files are nearby. For this, it uses tree-sitter — a parser that builds a syntax tree for every Python file in the project.
 
-Из дерева извлекаются **символы**: имена функций, классов, методов — с номерами строк и сигнатурами. По ним строится BM25-индекс (классический текстовый поиск). Запрос пользователя ранжируется по релевантности символов, и система находит нужные файлы автоматически.
+**Symbols** are extracted from the tree: function names, classes, methods — with line numbers and signatures. A BM25 index (classic text search) is built on top of them. The user's query is ranked by symbol relevance, and the system finds the right files automatically.
 
-Это не семантический поиск — если функция называется `process_data`, а задача описана как «исправить обработку данных», BM25 может промахнуться. Но для конкретных имён работает точно и быстро, без GPU-затрат на эмбеддинги.
+This is not semantic search — if a function is called `process_data` and the task is described as "fix data processing," BM25 might miss. But for specific names it works precisely and fast, with no GPU cost for embeddings.
 
 ---
 
-## Агенты — база знаний в git
+## Agents — A Knowledge Base in Git
 
-Откуда агенты берут знания? Из markdown-файлов в git клиентского проекта:
+Where do agents get their knowledge? From markdown files in the client project's git repository:
 
 ```
 agents/
-  style/global.md      ← именование, форматирование, запреты
-  arch/overview.md     ← модули, зависимости, поток данных
-  context/project.md   ← цель проекта, бизнес-правила
+  style/global.md      ← naming, formatting, restrictions
+  arch/overview.md     ← modules, dependencies, data flow
+  context/project.md   ← project goal, business rules
 ```
 
-Это обычные текстовые файлы, которые пишет команда. Style-агент знает ваши соглашения, arch-агент — ваши модули и зависимости, context-агент — зачем вообще существует проект.
+These are plain text files written by the team. The style agent knows your conventions, the arch agent knows your modules and dependencies, the context agent knows why the project exists in the first place.
 
-Агенты полезны ровно настолько, насколько подробно описаны знания. Пустой шаблон → пустое мемо. Подробное описание → точная подсказка для кодера.
+Agents are exactly as useful as the knowledge described in them. Empty template → empty memo. Detailed description → precise hint for the coder.
 
-Пайплайн конфигурируется через `pipeline.json` — можно менять порядок, отключать стадии, добавлять своих агентов. Нужен security-агент? Создайте `agents/security/global.md` и добавьте стадию.
-
----
-
-## KV-cache: ускорение, а не расширение
-
-Помимо пайплайна есть и ручной режим — загрузить конкретный файл и задавать вопросы напрямую. Здесь работает другая оптимизация: сохранение KV-cache модели на диск.
-
-Когда модель «читает» файл, она формирует внутреннее состояние — матрицы key/value для каждого слоя. Это состояние можно сохранить в файл и загрузить потом за ~1 секунду вместо повторного чтения (~15 секунд).
-
-Это **не расширяет** контекст — файл по-прежнему должен влезать в 8192 токена. Но экономит время при повторных обращениях к одному файлу.
-
-Паттерны привязаны к git-ветке. Переключился — загружаются паттерны этой ветки. В feature-ветках диалог накапливается между сессиями (модель «помнит» предыдущие вопросы). В main — паттерны пересоздаются при каждом коммите.
+The pipeline is configured via `pipeline.json` — you can change the order, disable stages, add your own agents. Need a security agent? Create `agents/security/global.md` and add a stage.
 
 ---
 
-## Чего это не делает
+## KV-Cache: Acceleration, Not Expansion
 
-**Не расширяет контекст.** Пайплайн обходит ограничение через дистилляцию, но каждая отдельная стадия по-прежнему работает в рамках 8192 токенов. Очень большие файлы обрезаются.
+Besides the pipeline, there's also a manual mode — load a specific file and ask questions directly. A different optimization works here: saving the model's KV-cache to disk.
 
-**Нет семантического поиска.** Навигация — текстовая (BM25). Если имя функции не совпадает с описанием задачи, система может промахнуться.
+When the model "reads" a file, it forms an internal state — key/value matrices for each layer. This state can be saved to a file and loaded later in ~1 second instead of re-reading (~15 seconds).
 
-**Только Python.** Tree-sitter навигатор парсит `.py` файлы. Другие языки требуют добавления соответствующих грамматик.
+This **does not expand** the context — the file still has to fit within 8192 tokens. But it saves time on repeated access to the same file.
 
-**Одна модель на всё.** Навигация, агенты, кодер, ревьюер — на одной Qwen3-8B. Качество diff ограничено возможностями 8B-модели.
-
-**Паттерны не переносимы.** KV-cache привязан к конкретной модели и квантизации. Другая машина с другой версией не загрузит чужие паттерны.
+Patterns are tied to the git branch. Switch branches — and the patterns for that branch are loaded. In feature branches, the conversation accumulates between sessions (the model "remembers" previous questions). In main — patterns are recreated on each commit.
 
 ---
 
-## Зачем это, если есть Claude и GPT-4?
+## What This Doesn't Do
 
-Справедливый вопрос. Облачные модели мощнее, контекст больше, качество выше. Но:
+**Doesn't expand context.** The pipeline works around the limitation through distillation, but each individual stage still operates within the 8192-token window. Very large files get truncated.
 
-**Данные не покидают машину.** Для компаний с NDA или чувствительным кодом — это не вопрос удобства, а требование. Локальная модель на своей видеокарте — единственный вариант.
+**No semantic search.** Navigation is text-based (BM25). If the function name doesn't match the task description, the system can miss.
 
-**Нет API-ключей и подписок.** Один раз скачал модель (~5 GB) — работай сколько угодно. Нет зависимости от стороннего сервиса, нет лимитов, нет неожиданных счетов.
+**Python only.** The tree-sitter navigator parses `.py` files. Other languages require adding the corresponding grammars.
 
-**Образовательная ценность.** Пайплайн наглядно показывает, как именно можно обойти ограничения маленькой модели — через декомпозицию задачи и дистилляцию контекста. Это паттерн, применимый за пределами конкретного инструмента.
+**One model for everything.** Navigation, agents, coder, reviewer — all on a single Qwen3-8B. Diff quality is limited by the capabilities of an 8B model.
 
----
-
-## Как это применимо в работе
-
-**Поправить функцию.** Пишешь задачу → tree-sitter находит файл → агенты добавляют контекст → кодер пишет diff → ревьюер проверяет → `/patch`. Весь цикл — одна команда.
-
-**Анализ конкретного файла.** Загрузил файл → задаёшь вопросы напрямую к модели. Диалог накапливается в KV-cache — модель помнит предыдущие ответы.
-
-**Ревью по соглашениям.** `/review @file` прогоняет файл через style-агент. Модель проверяет код по вашим правилам, а не по общим принципам.
-
-**База знаний команды.** `agents/` с описанием архитектуры, стиля, контекста хранится в git. Новый разработчик получает те же агенты, что и команда.
+**Patterns are not portable.** The KV-cache is tied to a specific model and quantization. A different machine with a different version won't load someone else's patterns.
 
 ---
 
-## Где это находится сейчас
+## Why This If Claude and GPT-4 Exist?
 
-Работающий прототип. Полный цикл: задача → навигация → пайплайн агентов → diff → применение — работает на реальных проектах. Одна модель (Qwen3-8B, ~5 GB VRAM), всё in-process, без внешних зависимостей кроме llama-cpp-python и tree-sitter.
+Fair question. Cloud models are more powerful, context is larger, quality is higher. But:
 
-Инструменты для реализации уже доступны — локальные модели на потребительском железе поддерживают всё необходимое. Подход можно адаптировать к другим моделям и языкам.
+**Data never leaves the machine.** For companies with NDAs or sensitive code, this isn't a matter of convenience — it's a requirement. A local model on your own GPU is the only option.
 
-Код открыт — [github.com/kriusov/Cognit](https://github.com/kriusov/Cognit).
+**No API keys or subscriptions.** Download the model once (~5 GB) — work as much as you want. No dependency on a third-party service, no limits, no surprise bills.
+
+**Educational value.** The pipeline clearly demonstrates how to work around the limitations of a small model — through task decomposition and context distillation. This is a pattern applicable beyond this specific tool.
 
 ---
 
-*Реализовано на Python с использованием Qwen3-8B (трансформер, GGUF-квантизация), tree-sitter для навигации по коду и BM25 для поиска символов. Все операции выполняются локально.*
+## How This Applies in Practice
+
+**Fix a function.** Write a task → tree-sitter finds the file → agents add context → coder writes a diff → reviewer checks → `/patch`. The entire cycle — one command.
+
+**Analyze a specific file.** Load a file → ask the model questions directly. The conversation accumulates in the KV-cache — the model remembers previous answers.
+
+**Review against conventions.** `/review @file` runs the file through the style agent. The model checks the code against your rules, not general principles.
+
+**Team knowledge base.** `agents/` with architecture, style, and context descriptions is stored in git. A new developer gets the same agents as the rest of the team.
+
+---
+
+## Where This Is Now
+
+A working prototype. The full cycle: task → navigation → agent pipeline → diff → application — works on real projects. One model (Qwen3-8B, ~5 GB VRAM), everything in-process, no external dependencies besides llama-cpp-python and tree-sitter.
+
+The tools to build this are already available — local models on consumer hardware support everything needed. The approach can be adapted to other models and languages.
+
+Code is open-source — [github.com/Volk-Arch/Cognit](https://github.com/Volk-Arch/Cognit).
+
+---
+
+*Built with Python using Qwen3-8B (transformer, GGUF quantization), tree-sitter for code navigation, and BM25 for symbol search. All operations run locally.*

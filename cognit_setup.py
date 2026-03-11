@@ -3,16 +3,16 @@
 # Copyright (c) 2026 Igor Kriusov <kriusovia@gmail.com>
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 """
-cognit_setup.py — одноразовая настройка Cognit для проекта
-========================================================
-Запуск:
+cognit_setup.py — one-time Cognit setup for a project
+======================================================
+Usage:
     python cognit_setup.py
 
-Что делает:
-    1. Создаёт .echo.json  — фиксирует модель и бэкенд для команды
-    2. Добавляет echo_patterns/ в .gitignore
-    3. Устанавливает post-commit хук (опционально)
-    4. Показывает S3-команды для синхронизации паттернов
+What it does:
+    1. Creates .echo.json  — locks the model and backend for the team
+    2. Adds echo_patterns/ to .gitignore
+    3. Installs post-commit hook (optional)
+    4. Shows S3 commands for pattern sync
 """
 
 import os
@@ -21,13 +21,15 @@ import json
 import subprocess
 from pathlib import Path
 
+from cognit_i18n import msg, set_lang
+
 ECHO_CONFIG   = ".echo.json"
 GITIGNORE     = ".gitignore"
 PATTERNS_BASE = "echo_patterns"
 
 
 # =============================================================================
-# ХЕЛПЕРЫ
+# HELPERS
 # =============================================================================
 def _git_root() -> Path | None:
     try:
@@ -59,12 +61,12 @@ def _ask_yn(prompt: str, default: bool = True) -> bool:
 
 
 def _ask_client_project() -> Path | None:
-    """Спрашивает путь к основному (клиентскому) проекту."""
-    print("\n── Основной проект (для git-хука) ──────────────────────")
-    print("   Cognit живёт в своём репо. Укажи путь к проекту,")
-    print("   который хочешь анализировать — хук поставится туда.")
+    """Ask for the path to the main (client) project."""
+    print(msg("setup_header"))
+    print(msg("setup_project_intro1"))
+    print(msg("setup_project_intro2"))
 
-    # Подставляем сохранённый путь как дефолт
+    # Use saved path as default
     existing_client = ""
     if Path(ECHO_CONFIG).exists():
         try:
@@ -73,44 +75,50 @@ def _ask_client_project() -> Path | None:
         except Exception:
             pass
 
-    raw = _ask("   Путь к проекту (Enter — пропустить)", existing_client)
+    raw = _ask(msg("setup_ask_project_path"), existing_client)
     if not raw:
         return None
 
     p = Path(raw).expanduser().resolve()
     if not p.exists():
-        print(f"   ⚠️  Путь не найден: {p}")
+        print(msg("setup_path_not_found", path=p))
         return None
     if not (p / ".git").exists():
-        print(f"   ⚠️  {p} — не git-репозиторий (нет папки .git)")
+        print(msg("setup_not_git_repo", path=p))
         return None
 
-    print(f"   Проект: {p.name}  ({p})")
+    print(msg("setup_project_name", name=p.name, path=p))
     return p
 
 
 # =============================================================================
-# ШАГ 1: .echo.json
+# STEP 1: .echo.json
 # =============================================================================
 def setup_config():
-    print("\n── Конфигурация проекта (.echo.json) ──────────────────")
+    print(msg("setup_config_header"))
 
     existing = {}
     if Path(ECHO_CONFIG).exists():
         with open(ECHO_CONFIG, "r", encoding="utf-8") as f:
             existing = json.load(f)
-        print(f"   Найден существующий {ECHO_CONFIG}")
+        print(msg("setup_found_existing", file=ECHO_CONFIG))
 
     ex_t = existing.get("transformer", {})
 
     t_model_path = _ask(
-        "   Путь к Transformer-модели (GGUF)",
+        msg("setup_ask_model_path"),
         ex_t.get("model_path", "models/Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf")
     )
+
+    lang = _ask("   Language / Язык (en/ru)", existing.get("lang", "en"))
+    if lang not in ("en", "ru"):
+        lang = "en"
+    set_lang(lang)
 
     config = {
         "backend":      "transformer",
         "patterns_dir": PATTERNS_BASE,
+        "lang":         lang,
         "transformer": {
             "model_path":   t_model_path,
             "n_gpu_layers": ex_t.get("n_gpu_layers", -1),
@@ -118,26 +126,26 @@ def setup_config():
             "max_tokens":   ex_t.get("max_tokens", 512),
         },
         "_note": (
-            "Все участники команды должны использовать одну модель. "
-            "Паттерны несовместимы между разными моделями."
+            "All team members must use the same model. "
+            "Patterns are incompatible between different models."
         ),
     }
 
     with open(ECHO_CONFIG, "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
 
-    print(f"   ✅ Создан {ECHO_CONFIG}")
+    print(msg("setup_config_created", file=ECHO_CONFIG))
     return config
 
 
 # =============================================================================
-# ШАГ 2: .gitignore
+# STEP 2: .gitignore
 # =============================================================================
 def setup_gitignore():
-    print("\n── .gitignore ──────────────────────────────────────────")
+    print(msg("setup_gitignore_header"))
 
     lines_to_add = [
-        "# Cognit — паттерны не версионируются, хранятся локально или в S3",
+        "# Cognit — patterns are not versioned, stored locally or in S3",
         f"{PATTERNS_BASE}/",
     ]
 
@@ -147,7 +155,7 @@ def setup_gitignore():
 
     to_add = [l for l in lines_to_add if l not in existing_lines]
     if not to_add:
-        print(f"   ✅ {GITIGNORE} уже содержит нужные записи")
+        print(msg("setup_gitignore_ok", file=GITIGNORE))
         return
 
     with open(GITIGNORE, "a", encoding="utf-8") as f:
@@ -155,20 +163,20 @@ def setup_gitignore():
 
     for line in to_add:
         if not line.startswith("#"):
-            print(f"   ✅ Добавлено в {GITIGNORE}: {line}")
+            print(msg("setup_gitignore_added", file=GITIGNORE, line=line))
 
 
 # =============================================================================
-# ШАГ 3: post-commit хук
+# STEP 3: post-commit hook
 # =============================================================================
 def _make_hook_script(echo_script_path: str) -> str:
-    """Генерирует скрипт хука с абсолютным путём к echo-скрипту."""
-    # Используем forward slashes — Git sh на Windows их понимает
+    """Generate hook script with absolute path to the echo script."""
+    # Use forward slashes — Git sh on Windows understands them
     posix_path = Path(echo_script_path).as_posix()
     return f"""\
 #!/bin/sh
 # Cognit — post-commit hook
-# echo-скрипт: {posix_path}
+# echo script: {posix_path}
 
 if git rev-parse HEAD~1 >/dev/null 2>&1; then
     CHANGED=$(git diff HEAD~1 HEAD --name-only)
@@ -193,16 +201,16 @@ done
 
 
 def setup_hook(target_git_root: Path, echo_script_path: Path):
-    """Устанавливает post-commit хук в указанный git-репозиторий."""
+    """Install post-commit hook into the specified git repository."""
     hook_path = target_git_root / ".git" / "hooks" / "post-commit"
 
     if hook_path.exists():
         overwrite = _ask_yn(
-            f"   Хук уже существует в {target_git_root.name}. Перезаписать?",
+            msg("setup_hook_exists", name=target_git_root.name),
             default=False,
         )
         if not overwrite:
-            print("   Пропускаю.")
+            print(msg("setup_skip"))
             return
 
     hook_path.parent.mkdir(parents=True, exist_ok=True)
@@ -215,45 +223,45 @@ def setup_hook(target_git_root: Path, echo_script_path: Path):
     except Exception:
         pass
 
-    print(f"   ✅ Хук установлен: {hook_path}")
+    print(msg("setup_hook_installed", path=hook_path))
 
 
 # =============================================================================
-# ШАГ 4: S3-инструкции
+# STEP 4: S3 instructions
 # =============================================================================
 def show_s3_instructions(config: dict, repo_name: str):
-    print("\n── Синхронизация паттернов через S3 ───────────────────")
+    print(msg("setup_s3_header"))
     bucket = "your-bucket"
     prefix = "echo-patterns"
 
     print(f"""
-   Структура пути паттернов:
-     Локально: {PATTERNS_BASE}/<repo>/<branch>/<name>.pkl
-     В S3:     s3://{bucket}/{prefix}/<repo>/<branch>/<name>.pkl
+   Pattern path structure:
+     Local:  {PATTERNS_BASE}/<repo>/<branch>/<name>.pkl
+     S3:     s3://{bucket}/{prefix}/<repo>/<branch>/<name>.pkl
 
-   Загрузить паттерны текущей ветки в S3:
+   Upload current branch patterns to S3:
      aws s3 sync {PATTERNS_BASE}/{repo_name}/ \\
          s3://{bucket}/{prefix}/{repo_name}/
 
-   Скачать паттерны с S3:
+   Download patterns from S3:
      aws s3 sync s3://{bucket}/{prefix}/{repo_name}/ \\
          {PATTERNS_BASE}/{repo_name}/
 
-   Скачать конкретную ветку:
+   Download specific branch:
      aws s3 sync s3://{bucket}/{prefix}/{repo_name}/main/ \\
          {PATTERNS_BASE}/{repo_name}/main/
 
-   Метаданные каждого паттерна (.json) содержат:
+   Each pattern metadata (.json) contains:
      backend, model, repo, branch, source_files
-   → Можно выбрать нужный файл по этим полям без загрузки .pkl
+   → You can pick the right file by these fields without downloading .pkl
 """)
 
 
 # =============================================================================
-# ШАГ 5: agents/ — знания о проекте
+# STEP 5: agents/ — project knowledge
 # =============================================================================
 
-# Шаблоны для каждого типа агента
+# Templates for each agent type
 _AGENT_TEMPLATES = {
     "style/global.md": """\
 # Стиль кода — DemoAI
@@ -462,49 +470,49 @@ P(H|E) = P(E|H) × P(H)
 
 
 def setup_agents(target_dir: Path | None = None):
-    """Создаёт папку agents/ в клиентском проекте (или CWD если не указан)."""
-    print("\n── agents/ — знания о проекте ──────────────────────────")
+    """Create agents/ folder in the client project (or CWD if not specified)."""
+    print(msg("setup_agents_header"))
 
     base = target_dir if target_dir else Path(".")
     agents_dir = base / "agents"
 
     if target_dir:
-        print(f"   Создаю в: {target_dir}")
+        print(msg("setup_creating_in", dir=target_dir))
 
     created = []
 
     for rel_path, content in _AGENT_TEMPLATES.items():
         target = agents_dir / rel_path
         if target.exists():
-            print(f"   • {rel_path}  (уже существует, пропускаю)")
+            print(msg("setup_file_exists", path=rel_path))
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         created.append(rel_path)
-        print(f"   ✅ Создан: {target}")
+        print(msg("setup_file_created", path=target))
 
     if not created:
-        print("   Все файлы уже существуют.")
+        print(msg("setup_all_exist"))
         return
 
     agents_path = agents_dir.resolve()
     print(f"""
-   Структура agents/:
+   agents/ structure:
      {agents_path}/
-       style/global.md    — стиль кода (дефолт: Python best practices)
-       style/commands.md  — стиль CLI-вывода (дефолт: заполнен)
-       arch/overview.md   — архитектура (замени на свою структуру)
-       context/project.md — цели, решения, ограничения (замени)
+       style/global.md    — code style (default: Python best practices)
+       style/commands.md  — CLI output style (default: filled in)
+       arch/overview.md   — architecture (replace with your structure)
+       context/project.md — goals, decisions, constraints (replace)
 
-   Cognit при следующем запуске автоматически:
-     1. Загрузит агентов из этих папок и создаст KV-cache паттерны
-     2. Подключит агентов в пайплайн и ambient-режим
+   Cognit on next run will automatically:
+     1. Load agents from these folders and create KV-cache patterns
+     2. Connect agents to pipeline and ambient mode
 
-   Можно сразу запустить — дефолтные файлы уже рабочие.
-   Лучший результат — после заполнения arch/ и context/ под свой проект.
+   You can run immediately — default files are already functional.
+   Best results — after filling arch/ and context/ for your project.
 """)
 
-    print("   Совет: agents/ нужно добавить в git клиентского проекта.")
+    print(msg("setup_agents_tip"))
     print(f"   cd {base.resolve()} && git add agents/ && git commit -m 'Add agent knowledge base'")
 
 
@@ -514,15 +522,21 @@ def setup_agents(target_dir: Path | None = None):
 def main():
     import sys
 
-    # Субкоманды: python cognit_setup.py agents
+    # Load language from .echo.json if available
+    if Path(ECHO_CONFIG).exists():
+        try:
+            with open(ECHO_CONFIG, encoding="utf-8") as f:
+                _cfg = json.load(f)
+            set_lang(_cfg.get("lang", "en"))
+        except Exception:
+            pass
+
+    # Subcommands: python cognit_setup.py agents
     if len(sys.argv) > 1:
         subcmd = sys.argv[1].lower()
         if subcmd == "agents":
-            print("""
-╔══════════════════════════════════════════════╗
-║  🧠 Cognit — Инициализация agents/          ║
-╚══════════════════════════════════════════════╝""")
-            # Читаем client_project из .echo.json если есть
+            print(msg("setup_banner_agents"))
+            # Read client_project from .echo.json if available
             client = None
             if Path(ECHO_CONFIG).exists():
                 try:
@@ -534,49 +548,46 @@ def main():
             setup_agents(client)
             return
         else:
-            print(f"Неизвестная команда: {subcmd}")
-            print("Использование: python cognit_setup.py [agents]")
+            print(msg("setup_unknown_cmd", cmd=subcmd))
+            print(msg("setup_usage"))
             sys.exit(1)
 
-    print("""
-╔══════════════════════════════════════════════╗
-║  🧠 Cognit — Настройка проекта             ║
-╚══════════════════════════════════════════════╝""")
+    print(msg("setup_banner_main"))
 
     git_root = _git_root()
     if git_root:
         repo_name = _git_repo_name(git_root)
-        print(f"\n   Git-репозиторий: {repo_name}  ({git_root})")
+        print(msg("setup_git_repo", name=repo_name, path=git_root))
     else:
         repo_name = "local"
-        print("\n   ⚠️  Git-репозиторий не обнаружен. Паттерны будут в echo_patterns/local/")
+        print(msg("setup_no_git"))
 
     config = setup_config()
     setup_gitignore()
 
-    # Абсолютный путь к скрипту (для прописывания в хук)
+    # Absolute path to the script (for the hook)
     echo_dir = Path(__file__).parent.resolve()
     transformer_script = echo_dir / "cognit_transformer.py"
 
-    # Хуки в основном (клиентском) проекте
+    # Hook in the main (client) project
     client_root = _ask_client_project()
     if client_root:
-        if _ask_yn(f"\n   Установить post-commit хук в {client_root.name}?", default=True):
+        if _ask_yn(msg("setup_ask_hook_client", name=client_root.name), default=True):
             setup_hook(client_root, transformer_script)
-        # Сохраняем путь к клиентскому проекту в .echo.json
+        # Save client project path to .echo.json
         config["client_project"] = str(client_root)
         with open(ECHO_CONFIG, "w", encoding="utf-8") as f:
             json.dump(config, f, ensure_ascii=False, indent=2)
-        print(f"   ✅ client_project сохранён в {ECHO_CONFIG}")
+        print(msg("setup_client_saved", file=ECHO_CONFIG))
 
-    # Хук в самом Cognit-репозитории (опционально)
-    if git_root and _ask_yn("\nУстановить post-commit хук и в Cognit-репозитории?", default=False):
+    # Hook in Cognit repo itself (optional)
+    if git_root and _ask_yn(msg("setup_ask_hook_cognit"), default=False):
         setup_hook(git_root, transformer_script)
 
-    if _ask_yn("\nСоздать папку agents/ с шаблонами?", default=True):
-        setup_agents(client_root)  # None если клиент не задан → создаст в CWD
+    if _ask_yn(msg("setup_ask_agents"), default=True):
+        setup_agents(client_root)  # None if no client → creates in CWD
 
-    # Создаём pipeline.json в клиентском проекте если его нет
+    # Create pipeline.json in client project if it doesn't exist
     if client_root:
         try:
             from cognit_pipeline import save_default_pipeline
@@ -586,7 +597,7 @@ def main():
 
     show_s3_instructions(config, repo_name)
 
-    print("✅ Настройка завершена.\n")
+    print(msg("setup_done"))
 
 
 if __name__ == "__main__":

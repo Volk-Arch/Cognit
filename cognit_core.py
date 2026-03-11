@@ -3,13 +3,13 @@
 # Copyright (c) 2026 Igor Kriusov <kriusovia@gmail.com>
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 """
-cognit_core.py — Общие утилиты для cognit_transformer.py
+cognit_core.py — Common utilities for cognit_transformer.py
 =============================================================
-Не загружает никаких моделей. Чистые функции для работы с:
-  - git-контекстом (repo, branch, путь к паттернам)
-  - хешированием файлов
-  - чтением метаданных паттернов
-  - CLI-хелперами (список, подсказки)
+Does not load any models. Pure functions for working with:
+  - git context (repo, branch, patterns path)
+  - file hashing
+  - reading pattern metadata
+  - CLI helpers (listing, hints)
 """
 
 import os
@@ -19,11 +19,13 @@ import subprocess
 from pathlib import Path
 from datetime import datetime
 
+from cognit_i18n import msg
+
 PATTERNS_BASE = "echo_patterns"
 
 
 # =============================================================================
-# GIT-КОНТЕКСТ
+# GIT CONTEXT
 # =============================================================================
 def git_repo_name() -> str:
     try:
@@ -48,17 +50,17 @@ def git_branch() -> str:
 
 
 def make_patterns_dir(repo: str, branch: str) -> str:
-    """Возвращает путь к директории паттернов и создаёт её."""
+    """Returns the path to the patterns directory and creates it."""
     d = f"{PATTERNS_BASE}/{repo}/{branch}"
     os.makedirs(d, exist_ok=True)
     return d
 
 
 # =============================================================================
-# ХЕШИРОВАНИЕ ФАЙЛОВ
+# FILE HASHING
 # =============================================================================
 def file_hash(path: str) -> str:
-    """SHA-256 начала + конца файла. Быстро, достаточно для детекции изменений."""
+    """SHA-256 of file head + tail. Fast, sufficient for change detection."""
     h = hashlib.sha256()
     size = os.path.getsize(path)
     with open(path, "rb") as f:
@@ -70,10 +72,10 @@ def file_hash(path: str) -> str:
 
 
 # =============================================================================
-# МЕТАДАННЫЕ ПАТТЕРНОВ
+# PATTERN METADATA
 # =============================================================================
 def read_meta(patterns_dir: str, name: str) -> dict | None:
-    """Читает .json метаданные паттерна. Возвращает None если нет файла."""
+    """Reads .json pattern metadata. Returns None if file is missing."""
     p = Path(patterns_dir) / f"{name}.json"
     if not p.exists():
         return None
@@ -92,7 +94,7 @@ def pattern_exists(patterns_dir: str, name: str) -> bool:
 
 
 def list_pattern_names(patterns_dir: str) -> list[str]:
-    """Имена всех паттернов (без _служебных)."""
+    """Names of all patterns (excluding _internal ones)."""
     return [
         p.stem for p in sorted(Path(patterns_dir).glob("*.pkl"))
         if not p.stem.startswith("_")
@@ -101,14 +103,14 @@ def list_pattern_names(patterns_dir: str) -> list[str]:
 
 def default_grow_policy(branch: str, source_paths: list[str]) -> str:
     """
-    Определяет политику обновления паттерна по умолчанию.
+    Determines the default pattern update policy.
 
-    retrain — пересоздаётся при изменении файлов (диалог сбрасывается):
-      - ветки main / master
-      - паттерны из agents/
+    retrain — recreated when files change (dialogue is reset):
+      - main / master branches
+      - patterns from agents/
 
-    grow — накапливает диалог, не пересоздаётся автоматически:
-      - feature-ветки (всё остальное)
+    grow — accumulates dialogue, not recreated automatically:
+      - feature branches (everything else)
     """
     if branch in ("main", "master"):
         return "retrain"
@@ -119,19 +121,19 @@ def default_grow_policy(branch: str, source_paths: list[str]) -> str:
 
 
 # =============================================================================
-# CLI-ХЕЛПЕРЫ
+# CLI HELPERS
 # =============================================================================
 def print_patterns_list(patterns_dir: str):
-    """Показывает все паттерны — одна строка на паттерн."""
+    """Shows all patterns — one line per pattern."""
     metas = [
         p for p in sorted(Path(patterns_dir).glob("*.json"))
         if not p.stem.startswith("_")
     ]
     if not metas:
-        print("   Паттернов нет — загрузи: /load <имя> @<файл>")
+        print(msg("info_patterns_list_empty"))
         return
 
-    print(f"📋 Паттернов: {len(metas)}")
+    print(msg("info_patterns_list_count", count=len(metas)))
     for p in metas:
         with open(p, encoding="utf-8") as f:
             m = json.load(f)
@@ -139,26 +141,26 @@ def print_patterns_list(patterns_dir: str):
         policy  = "~" if m.get("grow_policy") == "grow" else ""
         saved   = m.get("saved_at", "")[:10]          # 2026-03-09
         asks    = m.get("n_asks", 0)
-        asks_s  = f"  {asks}д" if asks else ""
+        asks_s  = f"  {asks}q" if asks else ""
         print(f"  • {m['name']}{policy}  [{backend}]  {saved}{asks_s}")
 
 
 def hint_patterns(patterns_dir: str):
-    """Одна строка с именами паттернов — подсказка при отсутствии активного."""
+    """One-line pattern names hint when no active pattern is selected."""
     names = list_pattern_names(patterns_dir)
     if names:
-        print(f"   Паттерны: {', '.join(names)}")
+        print(msg("info_hint_patterns") + f"  {', '.join(names)}")
     else:
-        print("   Паттернов нет — загрузи: /load <имя> @<файл>")
+        print(msg("info_patterns_list_empty"))
 
 
 # =============================================================================
-# ПРОВЕРКА АКТУАЛЬНОСТИ
+# STALENESS CHECK
 # =============================================================================
 def check_stale_sources(patterns_dir: str, name: str) -> list[str]:
     """
-    Возвращает список изменившихся/удалённых source_files для паттерна.
-    Пустой список = всё актуально.
+    Returns a list of changed/deleted source_files for a pattern.
+    Empty list = everything is up to date.
     """
     meta = read_meta(patterns_dir, name)
     if not meta:
@@ -168,17 +170,17 @@ def check_stale_sources(patterns_dir: str, name: str) -> list[str]:
     for src in meta.get("source_files", []):
         path = src["path"]
         if not os.path.exists(path):
-            changed.append(f"{path}  (не найден)")
+            changed.append(f"{path}  (not found)")
         elif file_hash(path) != src["hash"]:
             changed.append(path)
     return changed
 
 
 # =============================================================================
-# ROUTE: ПОСЛЕДНИЙ МАРШРУТ
+# ROUTE: LAST ROUTE
 # =============================================================================
 def save_route(patterns_dir: str, index: str, task: str, files: list[str]):
-    """Сохраняет последний результат route в _route_last.json."""
+    """Saves the last route result to _route_last.json."""
     route_path = Path(patterns_dir) / "_route_last.json"
     with open(route_path, "w", encoding="utf-8") as f:
         json.dump({
@@ -191,14 +193,14 @@ def save_route(patterns_dir: str, index: str, task: str, files: list[str]):
 
 
 def load_last_route(patterns_dir: str) -> dict | None:
-    """Читает _route_last.json. Возвращает None если нет или старше 24 часов."""
+    """Reads _route_last.json. Returns None if missing or older than 24 hours."""
     route_path = Path(patterns_dir) / "_route_last.json"
     if not route_path.exists():
         return None
     with open(route_path, encoding="utf-8") as f:
         data = json.load(f)
 
-    # Игнорируем маршруты старше 24 часов
+    # Ignore routes older than 24 hours
     try:
         routed_at = datetime.fromisoformat(data["routed_at"])
         age_hours = (datetime.now() - routed_at).total_seconds() / 3600
@@ -211,18 +213,18 @@ def load_last_route(patterns_dir: str) -> dict | None:
 
 
 # =============================================================================
-# СБОР ФАЙЛОВ ДЛЯ /load (уважает .gitignore)
+# FILE COLLECTION FOR /load (respects .gitignore)
 # =============================================================================
 
-# Расширения текстовых файлов которые имеет смысл читать модели
+# Text file extensions that are meaningful for the model to read
 TEXT_EXTENSIONS = {
-    # Код
+    # Code
     ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".java",
     ".c", ".cpp", ".h", ".hpp", ".cs", ".rb", ".php", ".swift",
     ".kt", ".vue", ".svelte", ".sh", ".bash", ".ps1",
-    # Данные / конфиг
+    # Data / config
     ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".env",
-    # Документация
+    # Documentation
     ".md", ".txt", ".rst",
 }
 
@@ -230,13 +232,13 @@ TEXT_EXTENSIONS = {
 def collect_text_files(dir_path: str | Path,
                        exclude_dirs: set[str] | None = None) -> list[Path]:
     """
-    Возвращает текстовые файлы из директории.
+    Returns text files from a directory.
 
-    Если это git-репо — использует `git ls-files` (автоматически
-    уважает .gitignore и возвращает только отслеживаемые файлы).
-    Иначе — rglob с фильтром по TEXT_EXTENSIONS.
+    If inside a git repo — uses `git ls-files` (automatically
+    respects .gitignore and returns only tracked files).
+    Otherwise — rglob filtered by TEXT_EXTENSIONS.
 
-    exclude_dirs: имена папок для исключения (например {"agents"}).
+    exclude_dirs: directory names to exclude (e.g. {"agents"}).
     """
     p = Path(dir_path).resolve()
     excl = exclude_dirs or set()
@@ -244,10 +246,10 @@ def collect_text_files(dir_path: str | Path,
     def _keep(f: Path) -> bool:
         if f.suffix.lower() not in TEXT_EXTENSIONS:
             return False
-        # Исключаем файлы внутри запрещённых папок
+        # Exclude files inside forbidden directories
         return not any(part in excl for part in f.relative_to(p).parts[:-1])
 
-    # Пробуем git ls-files
+    # Try git ls-files
     try:
         result = subprocess.run(
             ["git", "-C", str(p), "ls-files", "--cached", "."],
@@ -263,5 +265,5 @@ def collect_text_files(dir_path: str | Path,
     except Exception:
         pass
 
-    # Fallback: rglob без git
+    # Fallback: rglob without git
     return sorted(f for f in p.rglob("*") if f.is_file() and _keep(f))

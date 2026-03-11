@@ -3,12 +3,12 @@
 # Copyright (c) 2026 Igor Kriusov <kriusovia@gmail.com>
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 """
-cognit.py — единая точка входа Cognit.
+cognit.py — single entry point for Cognit.
 
-Запускает Transformer-бэкенд с интерактивным CLI.
-Маршрутизация файлов — через tree-sitter индекс (cognit_index.py).
+Starts the Transformer backend with interactive CLI.
+File routing — via tree-sitter index (cognit_index.py).
 
-Запуск:
+Run:
     python cognit.py
 """
 

@@ -1,159 +1,161 @@
 # Cognit — Persistent Neural Context
 
-Локальный AI-ассистент для кодовых баз. Одна модель (Qwen3-8B), всё in-process, без API-ключей.
+[🇷🇺 Русская версия](README.ru.md)
+
+A local AI assistant for codebases. One model (Qwen3-8B), everything in-process, no API keys required.
 
 ---
 
-## 1. Основные идеи
+## 1. Core Ideas
 
-### 1.1. Пайплайн с дистилляцией контекста
+### 1.1. Pipeline with Context Distillation
 
-Главная проблема маленьких моделей — ограниченный контекст. Qwen3-8B видит ~8000 токенов за раз. Если скормить ей файл + все соглашения по стилю + архитектуру + задачу — контекст переполнится, и на ответ не останется места.
+The main problem with small models is limited context. Qwen3-8B can only see ~8000 tokens at a time. If you feed it a file + all style conventions + architecture + the task — the context overflows and there's no room left for a response.
 
-Cognit решает это **последовательным пайплайном**: каждый агент в отдельном eval-проходе получает файл + свои знания и сжимает их до короткого мемо (2-4 предложения). Кодер в конце получает файл + сфокусированные мемо вместо всех исходных документов:
+Cognit solves this with a **sequential pipeline**: each agent in a separate eval pass receives the file + its own knowledge and compresses it into a short memo (2-4 sentences). The coder at the end receives the file + focused memos instead of all the original documents:
 
 ```
-Задача: «поправить функцию bayes_update»
+Task: "fix the bayes_update function"
   │
-  ├─ [1] Navigator        → «bayes_update() строки 42-67, зависит от validate_input()»
+  ├─ [1] Navigator        → "bayes_update() lines 42-67, depends on validate_input()"
   │
-  ├─ [2] analyst          → «заменить X на Y в строке 45, добавить валидацию в Z»
-  │       (анализирует код + задачу → конкретный план)
+  ├─ [2] analyst          → "replace X with Y at line 45, add validation to Z"
+  │       (analyzes code + task → specific plan)
   │
-  ├─ [3] context agent    → «цель проекта — демо байесовских методов»
-  │       (знания из agents/context/)
+  ├─ [3] context agent    → "project goal — demo of Bayesian methods"
+  │       (knowledge from agents/context/)
   │
-  ├─ [4] arch agent       → «не нарушать сигнатуру float→float, зависимости X→Y»
-  │       (знания из agents/arch/)
+  ├─ [4] arch agent       → "don't break the float→float signature, dependencies X→Y"
+  │       (knowledge from agents/arch/)
   │
-  ├─ [5] style agent      → «snake_case, type hints обязательны, docstring»
-  │       (знания из agents/style/)
+  ├─ [5] style agent      → "snake_case, type hints required, docstring"
+  │       (knowledge from agents/style/)
   │
-  ├─ [6] coder            → unified diff по плану аналитика + ограничениям агентов
+  ├─ [6] coder            → unified diff following analyst's plan + agent constraints
   │
-  └─ [7] reviewer         → проверяет diff по структуре кода, убирает дубли
+  └─ [7] reviewer         → validates diff against code structure, removes duplicates
               │
               ▼
-           /patch → файл обновлён
+           /patch → file updated
 ```
 
-**Арифметика контекста:**
+**Context arithmetic:**
 
 ```
-Без пайплайна:  файл 3000 + style.md 800 + arch.md 600 + context.md 500 + задача 50 = 4950 токенов
-                Осталось на ответ: ~3200 токенов — впритык для diff
+Without pipeline:  file 3000 + style.md 800 + arch.md 600 + context.md 500 + task 50 = 4950 tokens
+                   Left for response: ~3200 tokens — barely enough for a diff
 
-С пайплайном:   analyst:       [файл 3000 + задача 50]                → мемо 80 токенов
-                style agent:   [файл 3000 + style.md 800 + задача 50] → мемо 80 токенов
-                arch agent:    [файл 3000 + arch.md 600 + задача 50]  → мемо 80 токенов
-                context agent: [файл 3000 + context.md 500 + задача 50] → мемо 80 токенов
-                кодер:         [файл 3000 + 4 мемо 320 + задача 50]   = 3370 токенов
-                Осталось на ответ: ~4800 токенов — запас для diff
+With pipeline:     analyst:       [file 3000 + task 50]                  → memo 80 tokens
+                   style agent:   [file 3000 + style.md 800 + task 50]   → memo 80 tokens
+                   arch agent:    [file 3000 + arch.md 600 + task 50]    → memo 80 tokens
+                   context agent: [file 3000 + context.md 500 + task 50] → memo 80 tokens
+                   coder:         [file 3000 + 4 memos 320 + task 50]    = 3370 tokens
+                   Left for response: ~4800 tokens — plenty of room for a diff
 ```
 
-Каждый агент работает в своём eval и видит полный контекст своих знаний. Кодер получает те же знания, но **сжатые в мемо** — и у него остаётся больше места для генерации кода.
+Each agent runs in its own eval and sees the full context of its knowledge. The coder receives the same knowledge, but **compressed into memos** — leaving more room for code generation.
 
-**Как это работает технически:** каждая стадия — это полный eval с нуля. Текст агента + весь накопленный shared-контекст сохраняются как временный паттерн, задаётся вопрос, мемо добавляется в shared, временный паттерн удаляется. Следующая стадия видит всё, что накопили предыдущие.
+**How it works technically:** each stage is a full eval from scratch. The agent text + all accumulated shared context is saved as a temporary pattern, the question is asked, the memo is added to the shared context, and the temporary pattern is deleted. The next stage sees everything that previous stages have accumulated.
 
-KV-cache continuation (дописать токены в существующий cache) ненадёжна для больших блоков текста — модель ломается на инжектах свыше ~700 токенов. Поэтому каждая стадия делает полный eval — это медленнее, но работает стабильно.
+KV-cache continuation (appending tokens to an existing cache) is unreliable for large text blocks — the model breaks on injections exceeding ~700 tokens. Therefore each stage does a full eval — slower, but stable.
 
-Агенты берут знания из `agents/` — markdown-файлов в git клиентского проекта. Это база знаний команды: соглашения по стилю, архитектурные решения, контекст проекта. Пайплайн конфигурируется через `pipeline.json` — можно менять порядок, отключать стадии, добавлять своих агентов.
+Agents draw knowledge from `agents/` — markdown files in the client project's git repository. This is the team's knowledge base: style conventions, architectural decisions, project context. The pipeline is configured via `pipeline.json` — you can change the order, disable stages, or add custom agents.
 
-### 1.2. KV-cache — ускорение повторных запросов
+### 1.2. KV-cache — Speeding Up Repeated Queries
 
-Пайплайн каждый раз перечитывает файлы с нуля — это надёжно, но медленно. Для **ручного режима** (когда работаешь с одним файлом и задаёшь вопросы) Cognit сохраняет KV-cache модели на диск:
+The pipeline re-reads files from scratch every time — reliable, but slow. For **manual mode** (when you're working with a single file and asking questions) Cognit saves the model's KV-cache to disk:
 
 ```
-/load auth @src/auth.py         → eval файла (~15 сек) → auth.pkl сохранён
-use auth → вопрос               → load_state (~1 сек) → ответ
+/load auth @src/auth.py         → eval file (~15 sec) → auth.pkl saved
+use auth → question              → load_state (~1 sec) → response
 ```
 
-Это не расширяет контекст — файл по-прежнему должен влезать в 8192 токена. Но экономит время при повторных обращениях к одному файлу.
+This doesn't extend the context — the file still needs to fit within 8192 tokens. But it saves time on repeated queries to the same file.
 
-### 1.3. Ветки и накопление знаний
+### 1.3. Branches and Knowledge Accumulation
 
-Сохранённые состояния (паттерны) привязаны к git-ветке. Переключился на другую ветку — Cognit автоматически использует её паттерны.
+Saved states (patterns) are tied to the git branch. Switch to a different branch — Cognit automatically uses its patterns.
 
 ```
 echo_patterns/my-project/
-  main/            ← пересоздаются при каждом коммите (retrain)
-  feature-login/   ← диалог накапливается между сессиями (grow)
+  main/            ← recreated on each commit (retrain)
+  feature-login/   ← conversation accumulates between sessions (grow)
 ```
 
-В feature-ветках каждый вопрос дописывается в KV-cache — модель помнит всю историю разговора. Post-commit хук обновляет паттерны изменённых файлов автоматически.
+In feature branches, each question is appended to the KV-cache — the model remembers the entire conversation history. A post-commit hook automatically updates patterns for changed files.
 
 ---
 
-## 2. Вспомогательные технологии
+## 2. Supporting Technologies
 
-### Tree-sitter — навигация по коду
+### Tree-sitter — Code Navigation
 
-Когда пользователь пишет задачу, Cognit должен найти нужные файлы. Для этого используется [tree-sitter](https://tree-sitter.github.io/) — парсер, который строит AST (Abstract Syntax Tree) для каждого Python-файла в проекте.
+When a user describes a task, Cognit needs to find the relevant files. For this it uses [tree-sitter](https://tree-sitter.github.io/) — a parser that builds an AST (Abstract Syntax Tree) for each Python file in the project.
 
-Из AST извлекаются **символы**: имена функций, классов, методов, импортов — вместе с номерами строк, сигнатурами и докстрингами. Это создаёт структурную карту проекта без необходимости читать весь код.
+**Symbols** are extracted from the AST: function names, classes, methods, imports — along with line numbers, signatures, and docstrings. This creates a structural map of the project without needing to read all the code.
 
-### BM25 — поиск по символам
+### BM25 — Symbol Search
 
-По извлечённым символам строится BM25-индекс — классический алгоритм текстового поиска (тот же, что в Elasticsearch). Запрос пользователя разбивается на токены и ранжируется по релевантности символов.
+A BM25 index is built from the extracted symbols — a classic text search algorithm (the same one used in Elasticsearch). The user's query is tokenized and ranked by symbol relevance.
 
 ```
-Запрос: «bayes update»
-Результаты:
-  • main.py: bayes_update() [строки 42-67]     ← BM25 score: 8.2
-  • main.py: validate_input() [строки 12-25]   ← BM25 score: 3.1
+Query: "bayes update"
+Results:
+  • main.py: bayes_update() [lines 42-67]     ← BM25 score: 8.2
+  • main.py: validate_input() [lines 12-25]   ← BM25 score: 3.1
 ```
 
-Индекс **инкрементальный** — при повторном запуске пропускает файлы с неизменённым хешем. Кеш хранится в `_code_index.json`.
+The index is **incremental** — on subsequent runs it skips files with unchanged hashes. The cache is stored in `_code_index.json`.
 
-### ChatML — формат общения с моделью
+### ChatML — Model Communication Format
 
-Qwen3 использует формат ChatML для разделения ролей. llama-cpp-python не применяет шаблон автоматически, поэтому Cognit оборачивает каждый запрос вручную:
+Qwen3 uses the ChatML format for role separation. llama-cpp-python does not apply the template automatically, so Cognit wraps each request manually:
 
 ```
 <|im_start|>user
-[текст]<|im_end|>
+[text]<|im_end|>
 <|im_start|>assistant
 ```
 
-Критический нюанс: `llm.tokenize()` вызывается с `special=True` — без этого специальные токены (`<|im_start|>`, `<|im_end|>`) не распознаются и модель не понимает структуру диалога.
+Critical detail: `llm.tokenize()` is called with `special=True` — without this, special tokens (`<|im_start|>`, `<|im_end|>`) are not recognized and the model cannot understand the dialog structure.
 
 ---
 
-## 3. Ограничения
+## 3. Limitations
 
-**Нет семантического поиска.** Навигация по коду работает через BM25 — текстовое совпадение ключевых слов с именами символов. Если функция называется `process_data`, а задача описана как «исправить обработку входных данных», BM25 может её не найти. В задаче нужно указывать конкретные имена или хотя бы примерное направление.
+**No semantic search.** Code navigation works via BM25 — text matching of keywords against symbol names. If a function is called `process_data` but the task is described as "fix input data processing", BM25 may not find it. Tasks should specify concrete names or at least an approximate direction.
 
-**Контекст модели ограничен 8192 токенами** (~300–400 строк кода). Пайплайн обрезает файлы свыше 8000 символов. Для больших файлов навигатор фокусирует контекст на нужных строках через номера из tree-sitter.
+**Model context is limited to 8192 tokens** (~300-400 lines of code). The pipeline truncates files exceeding 8000 characters. For large files, the navigator focuses context on the relevant lines using line numbers from tree-sitter.
 
-**Качество зависит от agents/.** Если `style/global.md` содержит только шаблон — style-агент не добавит ценности. Агенты полезны ровно настолько, насколько подробно описаны соглашения.
+**Quality depends on agents/.** If `style/global.md` contains only a template — the style agent won't add value. Agents are only as useful as the conventions described in them.
 
-**Только Python.** Tree-sitter навигатор парсит `.py` файлы. Другие языки требуют добавления соответствующих tree-sitter грамматик.
+**Python only.** The tree-sitter navigator parses `.py` files. Other languages require adding the corresponding tree-sitter grammars.
 
-**Паттерны не переносимы.** KV-cache привязан к конкретной модели и версии llama-cpp-python. Другая машина с другой квантизацией не сможет загрузить чужие паттерны.
+**Patterns are not portable.** KV-cache is tied to a specific model and llama-cpp-python version. A different machine with a different quantization cannot load another machine's patterns.
 
-**Одна модель на всё.** Навигация, агенты, кодер, ревьюер — всё работает на одной Qwen3-8B. Это удобно (один процесс, ~5 GB VRAM), но качество diff ограничено возможностями 8B-модели.
+**One model for everything.** Navigation, agents, coder, reviewer — everything runs on a single Qwen3-8B. This is convenient (one process, ~5 GB VRAM), but diff quality is limited by the capabilities of an 8B model.
 
 ---
 
-## Установка и настройка
+## Installation and Setup
 
 ```bash
 pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
 pip install tree-sitter tree-sitter-python
 ```
 
-Скачать модель (GGUF) и положить в `models/`:
+Download the model (GGUF) and place it in `models/`:
 - **Transformer**: `Qwen3-8B-Q4_K_M.gguf` (~4.7 GB VRAM)
 
-Одноразовая настройка:
+One-time setup:
 
 ```bash
 python cognit_setup.py
 ```
 
-Создаёт `.echo.json`, шаблоны `agents/`, `pipeline.json` и устанавливает git-хуки.
+Creates `.echo.json`, `agents/` templates, `pipeline.json`, and installs git hooks.
 
-### Конфигурация (`.echo.json`)
+### Configuration (`.echo.json`)
 
 ```json
 {
@@ -170,19 +172,19 @@ python cognit_setup.py
 
 ---
 
-## Быстрый старт
+## Quick Start
 
-### Типичная сессия — задача неизвестна (пайплайн)
+### Typical session — task is unknown (pipeline)
 
 ```
 python cognit.py
 
-🧠> поправить функцию bayes_update — сделать более расширенной
-   📇 Индекс: 3 файлов, 12 символов
-   📍 Найдено 4 символа в 1 файле:
+🧠> fix the bayes_update function — make it more comprehensive
+   📇 Index: 3 files, 12 symbols
+   📍 Found 4 symbols in 1 file:
       • main.py  (bayes_update, _read_prob, main)
 
-🚀 Пайплайн (7 стадий)
+🚀 Pipeline (7 stages)
   ✓ [nav     ] navigator
   ✓ [agent   ] analyst
   ✓ [agent   ] context
@@ -190,117 +192,117 @@ python cognit.py
   ✓ [agent   ] style
   ✓ [coder   ] coder
   ✓ [reviewer] reviewer
-  💡 Diff готов → /patch
+  💡 Diff ready → /patch
 
 🧠 [_pipeline]> /patch
-✅ Патч применён → main.py
+✅ Patch applied → main.py
 ```
 
-### Типичная сессия — файл известен (ручной режим)
+### Typical session — file is known (manual mode)
 
 ```
 python cognit.py
 
 🧠> /load auth @src/auth.py
-🧠 [auth]> есть ли баги в JWT-проверке?
-🧠 [auth]> /edit @src/auth.py убери хардкод RS256
-💡 Применить? → /patch
+🧠 [auth]> are there any bugs in the JWT verification?
+🧠 [auth]> /edit @src/auth.py remove hardcoded RS256
+💡 Apply? → /patch
 🧠 [auth]> /patch
-✅ Патч применён → src/auth.py
+✅ Patch applied → src/auth.py
 ```
 
 ---
 
-## Техническая информация
+## Technical Details
 
-### Хранение паттернов
+### Pattern Storage
 
 ```
 echo_patterns/<repo>/<branch>/
-  <name>.pkl / .json       ← KV-cache + метаданные (модель, хэши, файлы-источники)
-  _pipeline.pkl / .json    ← временный паттерн кодера (перезаписывается каждый прогон)
-  _pipeline_log_*.md       ← лог пайплайна (задача, мемо агентов, diff)
-  _code_index.json         ← кеш tree-sitter индекса
+  <name>.pkl / .json       ← KV-cache + metadata (model, hashes, source files)
+  _pipeline.pkl / .json    ← temporary coder pattern (overwritten each run)
+  _pipeline_log_*.md       ← pipeline log (task, agent memos, diff)
+  _code_index.json         ← tree-sitter index cache
 ```
 
-Паттерны привязаны к модели — `load_pattern` проверяет совместимость квантизации.
+Patterns are tied to the model — `load_pattern` checks quantization compatibility.
 
-| Политика | Когда | Поведение |
+| Policy | When | Behavior |
 |---|---|---|
-| `retrain` | `main`/`master`, `agents/` | Пересоздаётся при коммите (post-commit хук) |
-| `grow ~` | Feature-ветки | Накапливает диалог между сессиями |
+| `retrain` | `main`/`master`, `agents/` | Recreated on commit (post-commit hook) |
+| `grow ~` | Feature branches | Accumulates conversation between sessions |
 
-### agents/ — база знаний проекта
+### agents/ — Project Knowledge Base
 
-Markdown-файлы в git клиентского проекта. Загружаются автоматически при запуске:
+Markdown files in the client project's git repository. Loaded automatically on startup:
 
 ```
 agents/
-  style/global.md      ← именование, форматирование, запреты
-  arch/overview.md     ← модули, зависимости, поток данных
-  context/project.md   ← цель проекта, бизнес-правила
+  style/global.md      ← naming, formatting, restrictions
+  arch/overview.md     ← modules, dependencies, data flow
+  context/project.md   ← project goal, business rules
 ```
 
-**Добавить агента:** создать `agents/<name>/global.md` + добавить стадию в `pipeline.json`:
+**Adding an agent:** create `agents/<name>/global.md` + add a stage to `pipeline.json`:
 
 ```json
 {"id": "security", "type": "agent", "name": "security", "enabled": true,
- "role": "Задача: {task}\n\nКакие риски безопасности? Напиши кратко."}
+ "role": "Task: {task}\n\nWhat are the security risks? Write briefly."}
 ```
 
-### Правка кода
+### Code Editing
 
-**`/patch`** — извлекает все unified diff из последнего ответа, резолвит пути через `client_project`, создаёт `.cognit.bak` перед записью.
+**`/patch`** — extracts all unified diffs from the last response, resolves paths via `client_project`, creates a `.cognit.bak` before writing.
 
-**`/edit @file задача`** — читает файл заново (не из KV-cache) → точные номера строк → unified diff.
+**`/edit @file task`** — re-reads the file (not from KV-cache) → accurate line numbers → unified diff.
 
-### Структура
+### Structure
 
 ```
-my-project/              ← клиентский git
-  agents/                ← база знаний (в git)
-  pipeline.json          ← порядок стадий (в git)
+my-project/              ← client git repo
+  agents/                ← knowledge base (in git)
+  pipeline.json          ← stage order (in git)
 
-Cognit/                  ← этот репозиторий
-  cognit.py              ← точка входа
-  cognit_transformer.py  ← Transformer-бэкенд (KV-cache, Qwen3)
-  cognit_index.py        ← tree-sitter навигатор (AST + BM25)
-  cognit_pipeline.py     ← конфигурация пайплайна
-  cognit_core.py         ← утилиты (git, паттерны, хэши)
-  cognit_patch.py        ← применение unified diff
-  cognit_agents.py       ← работа с agents/
-  cognit_setup.py        ← одноразовая настройка
+Cognit/                  ← this repository
+  cognit.py              ← entry point
+  cognit_transformer.py  ← Transformer backend (KV-cache, Qwen3)
+  cognit_index.py        ← tree-sitter navigator (AST + BM25)
+  cognit_pipeline.py     ← pipeline configuration
+  cognit_core.py         ← utilities (git, patterns, hashes)
+  cognit_patch.py        ← unified diff application
+  cognit_agents.py       ← agents/ handling
+  cognit_setup.py        ← one-time setup
 ```
 
 ---
 
-## Команды
+## Commands
 
 ```bash
-# Паттерны
-/load auth @src/auth.py        # загрузить файл → паттерн
-/load repo @src/               # загрузить папку
-use auth                       # переключиться на паттерн
-/list                          # список паттернов
+# Patterns
+/load auth @src/auth.py        # load file → pattern
+/load repo @src/               # load directory
+use auth                       # switch to pattern
+/list                          # list patterns
 
-# Вопросы  [нужен активный паттерн]
-как работает login?            # ask — ответ в KV-cache (если grow)
-? как работает login?          # peek — ответ НЕ сохраняется
+# Questions  [requires active pattern]
+how does login work?           # ask — response saved to KV-cache (if grow)
+? how does login work?         # peek — response NOT saved
 
-# Правка кода
-/edit @src/auth.py убери дубли # свежее чтение → diff
-/patch                         # применить все diff из ответа
-/patch @src/other.py           # применить к конкретному файлу
+# Code editing
+/edit @src/auth.py remove dupes # fresh read → diff
+/patch                         # apply all diffs from response
+/patch @src/other.py           # apply to specific file
 
-# Навигация
-/index                         # обзор проекта (tree-sitter)
-/index bayes update            # BM25-поиск по символам
-route добавить rate limiting   # tree-sitter → пайплайн
+# Navigation
+/index                         # project overview (tree-sitter)
+/index bayes update            # BM25 symbol search
+route add rate limiting        # tree-sitter → pipeline
 
-# Агенты  [ручной режим]
-/agent style arch              # ambient: вопросы через [паттерн + агенты]
-/agent off                     # выключить
-/review @src/auth.py           # ревью через style-агент
+# Agents  [manual mode]
+/agent style arch              # ambient: questions via [pattern + agents]
+/agent off                     # disable
+/review @src/auth.py           # review via style agent
 
 # Headless
 python cognit_transformer.py --status
