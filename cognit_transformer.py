@@ -2,45 +2,7 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2026 Igor Kriusov <kriusovia@gmail.com>
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-"""
-Cognit — Persistent Neural Context (Transformer)
-====================================================
-Концепция: KV-cache локальной LLM = "паттерн активности" = персистентная память.
-
-Установка:
-    pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
-
-Модель (скачать GGUF, например с HuggingFace):
-    Qwen3-8B-Q4_K_M.gguf  (~4.7 GB VRAM)  ← рекомендую
-
-Запуск:
-    python cognit.py                   # через оркестратор (рекомендую)
-    python cognit_transformer.py       # напрямую
-    python cognit_transformer.py --status              # проверить устаревшие паттерны
-    python cognit_transformer.py --refresh-file <path> # пересоздать паттерн вручную
-
-Команды:
-    use <имя>                   — выбрать активный паттерн
-    <вопрос>                    — задать вопрос (следует политике: grow/retrain)
-    ? <вопрос>                  — временно сменить политику (grow↔retrain)
-    route <задача>              — найти файлы через tree-sitter индекс → запустить пайплайн
-    /load <имя> @<путь>          — загрузить файл/папку как паттерн
-    /load <имя> @<д1> @<д2>     — composite: несколько источников, один eval-проход
-    /load ?<имя> @<путь>         — загрузить с принудительным retrain
-    /load <имя> <текст>          — загрузить текст напрямую
-    /list                       — список паттернов
-    /patch                      — применить diff из последнего ответа к файлу
-    /patch @<файл>              — применить к конкретному файлу
-    /agents                     — список агентов из agents/ (авто-создаются при старте)
-    /agent <имя> [имя2 ...]     — включить ambient (все вопросы через [паттерн + агенты])
-    /agent off                  — выключить ambient
-    /review @<файл>             — ревью файла (агент style, эфемерно)
-    /review <агент> @<файл>     — ревью через конкретный агент
-    /review                     — ревью последнего ответа модели
-    /style @<файл>              — проверка стиля файла
-    /help                       — справка
-    /exit                       — выход
-"""
+"""cognit_transformer.py — Transformer backend (Qwen3). KV-cache → .pkl."""
 
 import os
 import re
@@ -54,7 +16,12 @@ import cognit_core as core
 from cognit_patch import (_extract_diff, _extract_all_diffs, _diff_target,
                           _is_new_file_diff, apply_patch as _apply_patch)
 from cognit_agents import echo_config as _echo_config, list_agents as _list_agents, read_agent_text as _read_agent_text
-from cognit_index import CodeIndex
+try:
+    from cognit_index import CodeIndex
+    _HAS_INDEX = True
+except ImportError:
+    CodeIndex = None
+    _HAS_INDEX = False
 
 # =============================================================================
 # КОНФИГУРАЦИЯ — читается из .echo.json (ключ "transformer"), defaults ниже
@@ -412,24 +379,6 @@ def ask_pattern(name: str, question: str, grow: bool = True) -> str:
     return response
 
 
-def _save_current_kv(name: str):
-    """Сохраняет текущий KV-cache llm в паттерн без дополнительного eval.
-    Используется после _chain_ask чтобы follow-up вопросы имели полный контекст."""
-    state = llm.save_state()
-    pattern_path = Path(PATTERNS_DIR) / f"{name}.pkl"
-    meta_path    = Path(PATTERNS_DIR) / f"{name}.json"
-    with open(pattern_path, "wb") as f:
-        pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
-    if meta_path.exists():
-        with open(meta_path, "r", encoding="utf-8") as f:
-            meta = json.load(f)
-        meta["n_tokens"]   = llm.n_tokens
-        meta["size_kb"]    = round(pattern_path.stat().st_size / 1024, 1)
-        meta["updated_at"] = datetime.now().isoformat()
-        with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(meta, f, ensure_ascii=False, indent=2)
-
-
 def _extract_line_range(memo: str, filename: str) -> tuple[int, int] | None:
     """
     Парсит диапазон строк из навигационного мемо для конкретного файла.
@@ -642,54 +591,9 @@ def _run_pipeline(task: str, files: list[str], nav_memo: str = "") -> str:
     return coder_response or ""
 
 
-def _peek_pattern(name: str, prompt: str) -> str | None:
-    """
-    Тихий инференс на паттерне без вывода и без сохранения состояния.
-    Используется для роутинговых запросов к оркестратору.
-    """
-    pkl = Path(PATTERNS_DIR) / f"{name}.pkl"
-    if not pkl.exists():
-        return None
-    try:
-        with open(pkl, "rb") as f:
-            state = pickle.load(f)
-        llm.load_state(state)
-        meta = core.read_meta(PATTERNS_DIR, name)
-        if meta and "n_tokens" in meta:
-            llm.n_tokens = meta["n_tokens"]
-        # /no_think подавляет расширенный reasoning Qwen3 (экономит токены)
-        q_tokens = llm.tokenize(_question_prompt(prompt + "\n/no_think").encode("utf-8"), add_bos=False, special=True)
-        collected = []
-        for token_id in llm.generate(q_tokens, reset=False, temp=0.1, top_p=0.9):
-            piece = llm.detokenize([token_id]).decode("utf-8", errors="replace")
-            collected.append(piece)
-            full = "".join(collected)
-            if any(stop in full[-60:] for stop in STOP_TOKENS):
-                break
-            if len(collected) >= 400:  # 120 → 400: think-блок один съедает ~200 токенов
-                break
-        response = "".join(collected)
-        # Qwen3 оборачивает reasoning в <think>...</think> — берём только ответ
-        if "</think>" in response:
-            response = response.split("</think>", 1)[1].strip()
-        for stop in STOP_TOKENS:
-            if stop in response:
-                response = response[:response.index(stop)]
-        return response.strip()
-    except Exception:
-        return None
-
-
-
-
-
 def list_patterns():
     core.print_patterns_list(PATTERNS_DIR)
 
-
-# =============================================================================
-# CHAIN — агент-цепочки (/review, /style)
-# =============================================================================
 
 def _find_or_load_agent(agent_name: str) -> str | None:
     """
@@ -721,142 +625,49 @@ def _find_or_load_agent(agent_name: str) -> str | None:
     return agent_name if core.pattern_exists(PATTERNS_DIR, agent_name) else None
 
 
-def _chain_ask(base_pattern: str, extra_text: str, question: str,
-               no_think: bool = False) -> str:
-    """
-    Задаёт вопрос через KV-cache base_pattern с дополнительным контекстом.
-
-    Стратегия двух turn'ов:
-      1) eval() — инжектируем extra_text как отдельный user→assistant turn
-      2) generate() — задаём question стандартным _question_prompt
-
-    Это повторяет проверенный путь save_pattern(eval) + ask_pattern(generate).
-    Один гигантский user-message ломал Qwen3: модель сразу выдавала <|im_end|>.
-
-    Состояние НЕ сохраняется — эфемерная сессия (паттерн не меняется).
-    """
-    print(f"\n🔗 Цепочка: [{base_pattern}]")
-    if not load_pattern(base_pattern):
+def _read_pattern_source(name: str) -> str:
+    """Перечитывает исходные файлы паттерна из метаданных."""
+    meta = core.read_meta(PATTERNS_DIR, name)
+    if not meta:
         return ""
-    print(f"   KV-позиция: {llm.n_tokens} токенов")
+    parts = []
+    for src in meta.get("source_files", []):
+        p = Path(src["path"])
+        if p.exists():
+            try:
+                parts.append(p.read_text(encoding="utf-8", errors="ignore"))
+            except Exception:
+                pass
+    if not parts:
+        agent_text = _read_agent_text(name)
+        if agent_text:
+            return agent_text
+    return "\n\n---\n\n".join(parts)
 
-    # ── Шаг 1: инжектируем контекст как отдельный turn (eval, без генерации) ──
-    body = extra_text.strip()
-    if body:
-        inject = (
-            "<|im_start|>user\n"
-            f"{body}\n"
-            "<|im_end|>\n"
-            "<|im_start|>assistant\n"
-            "Контекст принят.\n"
-            "<|im_end|>\n"
-        )
-        inject_tokens = llm.tokenize(inject.encode("utf-8"), add_bos=False, special=True)
 
-        max_inject = N_CTX - llm.n_tokens - 512  # оставляем место для вопроса + ответа
-        if len(inject_tokens) > max_inject:
-            print(f"⚠️  Контекст большой ({len(inject_tokens)} токенов), обрезаем до {max_inject}")
-            inject_tokens = inject_tokens[:max_inject]
+def _ephemeral_eval_ask(texts: list[str], question: str,
+                        tmp_name: str = "_ephemeral_tmp") -> str:
+    """
+    Full-eval ask: combines texts → save_pattern → ask_pattern → cleanup.
 
-        print(f"   Контекст: {len(inject_tokens)} токенов  "
-              f"(KV: {llm.n_tokens} + {len(inject_tokens)} = {llm.n_tokens + len(inject_tokens)} / {N_CTX})")
-        llm.eval(inject_tokens)
-
-    # ── Шаг 2: задаём вопрос стандартным путём (как ask_pattern) ──────────────
-    q = question + "\n/no_think" if no_think else question
-    q_prompt = _question_prompt(q)
-    q_tokens = llm.tokenize(q_prompt.encode("utf-8"), add_bos=False, special=True)
-
-    print(f"   Вопрос: +{len(q_tokens)} токенов")
-    print(f"\n❓ {question}")
-    print("─" * 50)
-
-    collected = []
-    answer_started = False
-    think_dots = 0
-    junk_streak = 0  # подряд идущие «мусорные» токены (только `, пробелы, \n)
-
-    for token_id in llm.generate(q_tokens, reset=False, temp=0.3, top_p=0.9, repeat_penalty=1.1):
-        piece = llm.detokenize([token_id]).decode("utf-8", errors="replace")
-        collected.append(piece)
-        full = "".join(collected)
-
-        clean_piece = piece
-        for stop in STOP_TOKENS:
-            if stop in clean_piece:
-                clean_piece = clean_piece[:clean_piece.index(stop)]
-
-        if not answer_started:
-            if "</think>" in full:
-                if think_dots:
-                    print("\r" + " " * (think_dots + 10) + "\r", end="", flush=True)
-                after = full.split("</think>", 1)[1]
-                for stop in STOP_TOKENS:
-                    if stop in after:
-                        after = after[:after.index(stop)]
-                if after.strip():
-                    print(after, end="", flush=True)
-                answer_started = True
-            elif not any(("<|im" in full, "<think>" in full)):
-                print(clean_piece, end="", flush=True)
-                answer_started = True
-            elif "<think>" in full and len(collected) % 12 == 0:
-                think_dots += 1
-                print(".", end="", flush=True)
-        else:
-            print(clean_piece, end="", flush=True)
-
-        tail = full[-60:]
-        if any(stop in tail for stop in STOP_TOKENS):
-            break
-        if len(collected) >= MAX_TOKENS:
-            break
-        # Детектор фейковых turn'ов: модель начала играть за Human/User
-        if answer_started:
-            recent_text = "".join(collected[-10:])
-            if any(p in recent_text for p in ANSWER_STOP_PATTERNS):
-                print("\n⚠️  Фейковый turn — генерация остановлена")
-                break
-            # Детектор повторных code-блоков: второй ```diff/```python → стоп
-            fence_count = full.count("```")
-            if fence_count >= 4:  # 2 блока = 4 fence-маркера
-                print("\n⚠️  Повторный code-блок — генерация остановлена")
-                break
-        # Детектор зацикливания: точное совпадение 40 токенов
-        if len(collected) >= 80:
-            recent = "".join(collected[-40:])
-            before = "".join(collected[-80:-40])
-            if recent == before:
-                print("\n⚠️  Зацикливание — генерация остановлена")
-                break
-        # Детектор мусорных токенов: `, пробелы, \n подряд → стоп
-        if piece.strip("`\n\r \t") == "":
-            junk_streak += 1
-            if junk_streak >= 6:
-                print("\n⚠️  Мусорный вывод — генерация остановлена")
-                break
-        else:
-            junk_streak = 0
-
-    if think_dots and not answer_started:
-        print("\r" + " " * (think_dots + 10) + "\r", end="", flush=True)
-
-    if not answer_started:
-        print("".join(collected), end="", flush=True)
-
-    print("\n" + "─" * 50)
-    print("   🔗 Цепочка завершена — паттерн не изменён")
-
-    response = "".join(collected)
-    if "</think>" in response:
-        response = response.split("</think>", 1)[1]
-    for stop in STOP_TOKENS + ANSWER_STOP_PATTERNS:
-        if stop in response:
-            response = response[:response.index(stop)]
-    result = response.strip()
-    if not result:
-        print("   ⚠️  Агент промолчал (пустой ответ)")
-    return result
+    Надёжная альтернатива _chain_ask для больших инжектов (700+ токенов).
+    Каждый текст объединяется через separator и прогоняется через полный eval.
+    Временный паттерн удаляется после использования.
+    """
+    combined = "\n\n---\n\n".join(t for t in texts if t and t.strip())
+    if not combined.strip():
+        return ""
+    print(f"\n🔄 Full-eval: {len(combined)} символов")
+    save_pattern(tmp_name, combined)
+    result = ask_pattern(tmp_name, question, grow=False)
+    for ext in (".pkl", ".json"):
+        p = Path(PATTERNS_DIR) / f"{tmp_name}{ext}"
+        if p.exists():
+            try:
+                p.unlink()
+            except Exception:
+                pass
+    return result or ""
 
 
 def _do_edit(file_path: str, task: str, base_pattern: str | None = None) -> str:
@@ -897,14 +708,12 @@ def _do_edit(file_path: str, task: str, base_pattern: str | None = None) -> str:
     )
 
     if base_pattern and core.pattern_exists(PATTERNS_DIR, base_pattern):
-        # Инжектируем содержимое файла поверх KV-cache паттерна
-        return _chain_ask(base_pattern, file_block, edit_question)
+        # Full eval: source + file → reliable for large files
+        base_source = _read_pattern_source(base_pattern)
+        return _ephemeral_eval_ask([base_source, file_block], edit_question, "_edit_tmp")
     else:
-        # Нет активного паттерна — временный из самого файла (не сохраняется)
-        _EDIT_TMP = "_edit_tmp"
-        _load_path(_EDIT_TMP, file_path)
-        resp = ask_pattern(_EDIT_TMP, edit_question, grow=False)
-        return resp or ""
+        # Нет активного паттерна — временный из самого файла
+        return _ephemeral_eval_ask([file_block], edit_question, "_edit_tmp")
 
 
 # =============================================================================
@@ -929,6 +738,9 @@ HELP = """
   /review arch @<файл> — ревью через любой агент из agents/
   /review              — ревью последнего ответа модели (diff/код)
   /style @<файл>       — проверка стиля файла
+  /index               — обзор проекта (tree-sitter символы)
+  /index <запрос>      — поиск символов по запросу (BM25)
+  /index --rebuild     — пересобрать индекс
   /list                — показать все паттерны
   /help                — эта справка
   /exit                — выход
@@ -943,6 +755,7 @@ HELP = """
   /edit @src/auth.py исправь JWT      ← читает файл свежо → точный diff
   /patch                              ← применяем diff к auth.py
   route добавить rate limiting        ← найти нужные файлы → пайплайн
+  /index bayes update                 ← найти символы по запросу
 """
 
 
@@ -1014,27 +827,11 @@ def _hint_patterns():
 
 
 def _auto_init_agents():
-    """
-    При старте проверяет агентов из agents/ клиентского проекта.
-    Если паттерн агента не создан — создаёт автоматически.
-    Вызывается один раз в начале cli_loop().
-    """
+    """Авто-загрузка ненайденных агентов из agents/ клиентского проекта."""
     cfg = _echo_config()
     client = cfg.get("client_project", "")
-
-    # cognit — служебный агент (handoff.md), не требует паттерна
-    _SYSTEM_AGENTS = {"cognit"}
-
-    # Удаляем служебные паттерны если они были ошибочно созданы
-    for _sa in _SYSTEM_AGENTS | {"orchestrator"}:
-        for ext in (".pkl", ".json"):
-            _p = Path(PATTERNS_DIR) / f"{_sa}{ext}"
-            if _p.exists():
-                _p.unlink()
-
     agents = _list_agents(PATTERNS_DIR)
-    missing = [(name, loaded) for name, loaded in agents
-               if not loaded and name not in _SYSTEM_AGENTS]
+    missing = [(name, loaded) for name, loaded in agents if not loaded]
 
     if missing and client:
         print(f"\n🔄 Авто-инициализация агентов ({len(missing)} из {len(agents)})...")
@@ -1048,59 +845,26 @@ def _auto_init_agents():
         print()
 
 
-# Ключевые слова для авто-подбора агентов.
-# Агент активируется если вопрос содержит хотя бы одно слово из списка.
-# Пополняется при появлении новых агентов — или через keywords.txt в папке агента.
-_AGENT_KEYWORDS: dict[str, list[str]] = {
-    # style подключается при любом написании/исправлении кода
-    "style":   ["стиль", "style", "форматирование", "naming", "конвенция",
-                "оформление", "lint", "pep8", "отступ", "импорт",
-                "поправ", "исправ", "напиши", "написать", "создай", "создать",
-                "добавь", "добавить", "реализ", "перепиш", "рефактор",
-                "fix", "write", "create", "implement", "refactor", "update"],
-    "arch":    ["архитектур", "arch", "структур", "design", "паттерн", "pattern",
-                "зависимост", "модул", "слой", "layer", "интерфейс"],
-    "context": ["контекст", "context", "проект", "цель", "требовани", "бизнес",
-                "зачем", "почему", "задача"],
-}
+_code_index_cache = None
+_code_index_project = ""
 
 
-def _load_agent_keywords(agent_name: str) -> list[str]:
-    """Читает keywords.txt из папки агента, если есть. Дополняет _AGENT_KEYWORDS."""
-    cfg = _echo_config()
-    kw_path = Path(cfg.get("client_project", "")) / "agents" / agent_name / "keywords.txt"
-    if not kw_path.exists():
-        return []
-    return [line.strip() for line in kw_path.read_text(encoding="utf-8").splitlines()
-            if line.strip() and not line.startswith("#")]
-
-
-def _suggest_agents(question: str) -> list[str]:
-    """
-    Подбирает агентов по ключевым словам в вопросе.
-    Только среди агентов у которых уже есть загруженный паттерн.
-    """
-    q = question.lower()
-    suggested = []
-    for agent_name, keywords in _AGENT_KEYWORDS.items():
-        if not core.pattern_exists(PATTERNS_DIR, agent_name):
-            continue
-        extra = _load_agent_keywords(agent_name)
-        if any(kw in q for kw in keywords + extra):
-            suggested.append(agent_name)
-    return suggested
-
-
-
-
-def _get_code_index() -> CodeIndex | None:
-    """Возвращает CodeIndex для клиентского проекта (кеширует)."""
+def _get_code_index(rebuild: bool = False):
+    """Возвращает CodeIndex для клиентского проекта (кеширует в модуле)."""
+    global _code_index_cache, _code_index_project
+    if not _HAS_INDEX:
+        print("⚠️  tree-sitter не установлен. pip install tree-sitter tree-sitter-python")
+        return None
     cfg = _echo_config()
     client_dir = cfg.get("client_project", "")
     if not client_dir or not Path(client_dir).exists():
         return None
+    if _code_index_cache is not None and _code_index_project == client_dir and not rebuild:
+        return _code_index_cache
     idx = CodeIndex(client_dir, cache_dir=PATTERNS_DIR)
     idx.build()
+    _code_index_cache = idx
+    _code_index_project = client_dir
     return idx
 
 
@@ -1196,6 +960,18 @@ def cli_loop() -> None:
                 elif cmd == "list":
                     list_patterns()
 
+                elif cmd == "index":
+                    query = " ".join(parts[1:]).strip() if len(parts) > 1 else ""
+                    idx = _get_code_index(rebuild=("--rebuild" in query))
+                    if idx is None:
+                        print("❌ Индекс недоступен (проверьте client_project и tree-sitter)")
+                        continue
+                    query = query.replace("--rebuild", "").strip()
+                    if query:
+                        print(idx.search_summary(query))
+                    else:
+                        print(idx.project_summary())
+
                 elif cmd == "load":
                     if len(parts) < 3:
                         print("❌ Использование: /load <имя> @<файл/папка>  или  /load <имя> <текст>")
@@ -1241,10 +1017,11 @@ def cli_loop() -> None:
                             print("❌ Нет предыдущего ответа. Задай вопрос об изменениях, затем /patch.")
                             continue
                         print("   Diff не найден — переформатирую предыдущий ответ...")
-                        last_response = _chain_ask(
-                            active,
-                            f"Предыдущий ответ:\n\n{last_response}",
+                        base_source = _read_pattern_source(active)
+                        last_response = _ephemeral_eval_ask(
+                            [base_source, f"Предыдущий ответ:\n\n{last_response}"],
                             "Покажи изменения из этого ответа в виде unified diff (```diff блок).",
+                            "_patch_tmp",
                         )
                         diffs = _extract_all_diffs(last_response)
                     if not diffs:
@@ -1359,9 +1136,12 @@ def cli_loop() -> None:
                             print(f"   Агенты: {', '.join(n for n, _ in agents)}")
                         continue
                     print(f"   Агент: {agent_name}  |  Анализирую: {label}")
-                    agent = _find_or_load_agent(agent_name)
-                    if agent:
-                        last_response = _chain_ask(agent, content, question)
+                    agent_source = _read_agent_text(agent_name)
+                    if agent_source:
+                        last_response = _ephemeral_eval_ask(
+                            [agent_source, content], question, "_review_tmp")
+                    else:
+                        print(f"⚠️  Агент {agent_name} не найден")
 
                 else:
                     print(f"❌ Неизвестная команда '/{cmd}'. Введите '/help'.")
@@ -1392,15 +1172,14 @@ def cli_loop() -> None:
                     print("❌ Сначала выбери паттерн: use <имя>")
                     _hint_patterns()
                     continue
-                effective_agents = ambient_agents or _suggest_agents(question)
-                if effective_agents:
-                    if not ambient_agents:
-                        print(f"🤖 Авто-агенты: {', '.join(effective_agents)}")
+                if ambient_agents:
                     agent_text = "\n\n---\n\n".join(
-                        t for name in effective_agents if (t := _read_agent_text(name))
+                        t for name in ambient_agents if (t := _read_agent_text(name))
                     )
                     if agent_text:
-                        last_response = _chain_ask(active, agent_text, question)
+                        base_source = _read_pattern_source(active)
+                        last_response = _ephemeral_eval_ask(
+                            [base_source, agent_text], question, "_ambient_tmp")
                     else:
                         last_response = ask_pattern(active, question, grow=False)
                 else:
@@ -1444,20 +1223,17 @@ def cli_loop() -> None:
                         print("❌ Не удалось найти файлы. Загрузи вручную: /load <имя> @<путь>")
                     continue
 
-                effective_agents = ambient_agents or _suggest_agents(user_input)
-                if effective_agents:
-                    if not ambient_agents:
-                        print(f"🤖 Авто-агенты: {', '.join(effective_agents)}")
+                if ambient_agents:
                     agent_text = "\n\n---\n\n".join(
-                        t for name in effective_agents if (t := _read_agent_text(name))
+                        t for name in ambient_agents if (t := _read_agent_text(name))
                     )
                     if agent_text:
-                        last_response = _chain_ask(active, agent_text, user_input)
-                        _save_current_kv(active)
+                        base_source = _read_pattern_source(active)
+                        last_response = _ephemeral_eval_ask(
+                            [base_source, agent_text], user_input, "_ambient_tmp")
                     else:
                         last_response = ask_pattern(active, user_input, grow=(active_policy == "grow"))
                 else:
-                    # Следуем политике паттерна: grow сохраняет, retrain — нет
                     last_response = ask_pattern(active, user_input, grow=(active_policy == "grow"))
 
                 # После любого ask: если в ответе есть код — подсказываем /patch
@@ -1568,17 +1344,14 @@ def headless_status():
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
-        if sys.argv[1] == "--auto-route":
-            init_model()
-            cli_loop(auto_route=True)
-        elif sys.argv[1] == "--refresh-file" and len(sys.argv) > 2:
+        if sys.argv[1] == "--refresh-file" and len(sys.argv) > 2:
             init_model()
             headless_refresh_file(sys.argv[2])
         elif sys.argv[1] == "--status":
             headless_status()  # не нужна модель
         else:
             print(f"Неизвестный флаг: {sys.argv[1]}")
-            print("Флаги: --auto-route, --refresh-file <path>, --status")
+            print("Флаги: --refresh-file <path>, --status")
             sys.exit(1)
     else:
         init_model()

@@ -1,83 +1,18 @@
-# TODO — локальный (не в git)
+# TODO
 
-## ✅ Реализовано
+## Done
 
-- [x] Правка кода нейросетью (`/patch`)
-- [x] Агент-цепочки (`/review`, `/style`) — эфемерный стек через `_chain_ask`
-- [x] Ambient-режим (`/agent <имя>`) — каждый вопрос через [паттерн + агент]
-- [x] Несколько агентов одновременно (`/agent style arch context`)
-- [x] Рефакторинг: echo_*.py → cognit_*.py, декомпозиция на модули
-- [x] Политика дообучения (grow_policy: grow/retrain, grow_policy по ветке)
-- [x] git-интеграция (post-commit хук, --refresh-file, --status)
-- [x] Персистентность по git-ветке (echo_patterns/repo/branch/)
-- [x] Авто-инициализация агентов при старте
-- [x] Авто-выбор агентов по ключевым словам
-- [x] Составные паттерны (composite `/load name @dir1 @dir2`)
-- [x] Конфиг моделей в .echo.json (пути, GPU layers, ctx)
-- [x] Авто-генерация card.md — модель описывает себя через `_peek_pattern`
-- [x] Полноценные шаблоны агентов (не заглушки — Python-конвенции, архитектура, контекст)
-- [x] `special=True` для tokenize — ChatML-токены как спецтокены, не текст
-- [x] Агенты пайплайна через full eval (`save_pattern` + `ask_pattern`)
-- [x] `/patch` мульти-файл — `_extract_all_diffs()`, резолвинг путей через `client_project`
-- [x] Проверка совместимости модели в `load_pattern` (квантизация Q4_K_M vs Q6_K)
-- [x] Детекторы генерации: junk streak, fake turns, fence count, loop detection
-- [x] Think-фаза: индикатор точек, `/no_think` для агентов, cleanup `</think>`
-- [x] RWKV удалён — заменён на tree-sitter навигатор (`cognit_index.py`)
-- [x] Tree-sitter индекс: AST-парсинг Python + BM25 поиск по символам
-- [x] Упрощение: cognit.py = просто лаунчер, нет оркестратора и переключения моделей
-- [x] Pipeline: stage type `rwkv` → `navigator` (с миграцией старых pipeline.json)
+- [x] Graceful degradation: tree-sitter import через try/except + `_HAS_INDEX` флаг
+- [x] Кеш CodeIndex на уровне модуля (`_code_index_cache`) — не пересобирается на каждый route
+- [x] `/index` команда: project_summary (без аргументов) и search_summary (с запросом), `--rebuild`
+- [x] Замена `_chain_ask` на `_ephemeral_eval_ask` (full eval) во всех call-site'ах
+- [x] Удаление `_chain_ask` и `_save_current_kv` (мёртвый код)
+- [x] Добавлен `_read_pattern_source` — перечитывает source files из метаданных паттерна
 
----
+## Backlog
 
-## 🔧 В работе / следующие
-
-- [ ] Web UI (минимальный)
-      — Flask + SSE для стриминга ответа
-      — Список паттернов сбоку, кнопка /patch, выбор агентов
-
-- [ ] Удалить `cognit_rwkv.py` из репозитория (файл больше не используется)
-
----
-
-## 🧪 Тестирование (с моделью)
-
-### Базовые сценарии
-
-- [ ] Smoke: запуск → авто-инит агентов → use → вопрос → ответ
-- [ ] Авто-инициализация: agents/ есть, .pkl нет → паттерны создаются при старте
-- [ ] Авто-выбор агентов: вопрос про стиль → style активируется автоматически
-- [ ] grow_policy: grow-паттерн накапливает диалог, retrain не сохраняет
-
-### Tree-sitter навигация
-
-- [ ] `python cognit.py` → задача без паттерна → tree-sitter находит файлы → пайплайн
-- [ ] `route <задача>` → индекс ищет символы → предлагает запустить пайплайн
-- [ ] Инкрементальный индекс: повторный build пропускает неизменённые файлы
-- [ ] Кеш `_code_index.json` загружается при перезапуске
-
-### Git-интеграция
-
-- [ ] post-commit хук: сделать коммит → паттерн изменённого файла пересоздаётся
-- [ ] --refresh-file: пересоздаёт только нужные паттерны, grow-паттерны пропускает
-
-### Команды
-
-- [ ] /review @file работает эфемерно, паттерн не изменяется после
-- [ ] /patch мульти-файл: два diff-блока → два запроса подтверждения
-
----
-
-## 💡 Идеи на потом
-
-- [ ] S3-синхронизация паттернов
-      — `cognit_sync.py push / pull`
-      — Паттерны → S3 для шаринга в команде
-
-- [ ] Тесты (pytest): save/load паттернов, route-парсинг, /patch apply
-- [ ] Поддержка других языков: tree-sitter-javascript, tree-sitter-typescript и т.д.
-- [ ] Confidence-детекция: если модель неуверена → авто-route предложение
-- [ ] VSCode-расширение: popup с предложением route прямо в редакторе
-- [ ] Параллельные агенты
-      — Несколько save_pattern+ask_pattern в потоках
-      — VRAM один → нужна сериализация доступа к llm
-- [ ] Qwen3 как нейронный ранжировщик: BM25 кандидаты → LLM ранжирует по релевантности
+- [ ] Neural ranking: Transformer ранжирует BM25-кандидатов (опционально, после `route`)
+- [ ] Поддержка других языков в tree-sitter (JS/TS, Go, Rust)
+- [ ] S3-синхронизация паттернов между машинами
+- [ ] Веб-интерфейс (read-only дашборд паттернов)
+- [ ] Тесты: unit-тесты для cognit_index.py, cognit_patch.py
