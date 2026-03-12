@@ -489,6 +489,14 @@ _MESSAGES = {
     "hook_no_patterns_dir":     {"en": "[Cognit] No patterns directory, skipping.",
                                   "ru": "[Cognit] Каталог паттернов не найден, пропускаю."},
 
+    # ── LLM reranking ────────────────────────────────────────────────────────
+    "info_reranking":           {"en": "   🔄 LLM reranking {count} candidates...",
+                                  "ru": "   🔄 LLM ранжирование {count} кандидатов..."},
+    "info_rerank_done":         {"en": "   ✅ Reranked → top {count} files",
+                                  "ru": "   ✅ Переранжировано → топ {count} файлов"},
+    "info_rerank_fallback":     {"en": "   ⚠️  Rerank failed, using BM25 order",
+                                  "ru": "   ⚠️  Ранжирование не удалось, используется BM25"},
+
     # ── cognit_core.py ───────────────────────────────────────────────────────
     "info_patterns_list_empty": {"en": "   No patterns — load: /load <name> @<file>",
                                   "ru": "   Паттернов нет — загрузи: /load <имя> @<файл>"},

@@ -427,6 +427,19 @@ class CodeIndex:
                     break
         return files
 
+    def format_candidates(self, results: list[SearchResult], max_items: int = 20) -> str:
+        """Format search results as a numbered list for LLM reranking."""
+        lines = []
+        for i, r in enumerate(results[:max_items], 1):
+            fname = Path(r.filepath).name
+            loc = f"{fname}:{r.symbol.line_start}-{r.symbol.line_end}"
+            sig = r.symbol.signature or r.symbol.name
+            doc = ""
+            if r.symbol.docstring:
+                doc = f'  "{r.symbol.docstring[:60]}"'
+            lines.append(f"{i}. {sig}  [{loc}]{doc}")
+        return "\n".join(lines)
+
     def file_summary(self, filepath: str) -> str:
         """Brief file description: classes, functions, imports."""
         syms = self.symbols.get(filepath, [])

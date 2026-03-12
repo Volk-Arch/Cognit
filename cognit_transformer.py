@@ -738,6 +738,44 @@ def _ephemeral_eval_ask(texts: list[str], question: str,
     return result or ""
 
 
+def _llm_rerank(task: str, candidates_text: str, top_k: int = 8) -> list[int]:
+    """
+    Ask the LLM to rerank search candidates by relevance to the task.
+    Returns list of candidate numbers (1-indexed) in order of relevance.
+    Falls back to empty list on failure (caller keeps BM25 order).
+    """
+    prompt = (
+        f"Task: {task}\n\n"
+        "Rank these code symbols by relevance to the task (most relevant first).\n"
+        "Return ONLY the numbers, separated by commas. No explanations.\n\n"
+        f"{candidates_text}"
+    )
+    print(msg("info_reranking", count=candidates_text.count("\n") + 1))
+    response = _ephemeral_eval_ask([prompt], "Which numbers are most relevant? Return comma-separated list.",
+                                   tmp_name="_rerank_tmp")
+    if not response:
+        return []
+    # Parse comma-separated integers
+    try:
+        nums = []
+        for token in response.replace("\n", ",").split(","):
+            token = token.strip().rstrip(".")
+            if token.isdigit():
+                nums.append(int(token))
+        # Deduplicate while preserving order
+        seen: set[int] = set()
+        result: list[int] = []
+        for n in nums:
+            if n not in seen:
+                seen.add(n)
+                result.append(n)
+            if len(result) >= top_k:
+                break
+        return result
+    except Exception:
+        return []
+
+
 def _do_edit(file_path: str, task: str, base_pattern: str | None = None) -> str:
     """
     Read file FRESH and ask the model to produce a unified diff.
@@ -913,13 +951,31 @@ def _route_via_index(task: str) -> tuple[list[str], str]:
         print(msg("warn_client_project"))
         return [], ""
 
-    # Search the index
-    results = idx.search(task, top_k=15)
+    # Phase 1: BM25 wide net
+    results = idx.search(task, top_k=20)
     if not results:
         print(msg("warn_no_symbols"))
         return [], ""
 
-    # Unique files (by score order)
+    # Phase 2: LLM rerank (if model loaded and enabled)
+    cfg = _echo_config()
+    rerank_enabled = cfg.get("transformer", {}).get("rerank", True)
+    if llm is not None and rerank_enabled and len(results) > 3:
+        candidates_text = idx.format_candidates(results)
+        reranked = _llm_rerank(task, candidates_text, top_k=8)
+        if reranked:
+            reordered = [results[i - 1] for i in reranked if 1 <= i <= len(results)]
+            # Append any remaining results not selected by LLM
+            selected = set(reranked)
+            for i, r in enumerate(results, 1):
+                if i not in selected:
+                    reordered.append(r)
+            results = reordered
+            print(msg("info_rerank_done", count=len(reranked)))
+        else:
+            print(msg("info_rerank_fallback"))
+
+    # Unique files (by score/rerank order)
     seen: set[str] = set()
     files: list[str] = []
     for r in results:

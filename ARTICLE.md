@@ -155,6 +155,26 @@ Fair question. Cloud models are more powerful, context is larger, quality is hig
 
 ---
 
+## Why This Architecture Looks Like the Brain
+
+During the design of Cognit, there was no conscious intent to replicate neuroscience models. The architecture emerged from a practical question: how to make a small model work effectively with a large codebase. But in retrospect, the result maps almost exactly onto **predictive coding** — a theory of how the brain itself processes information.
+
+**KV-cache as a predictive model.** The brain doesn't store raw sensory data — it maintains a compressed representation of the world that allows it to predict future inputs. A Cognit pattern is the same thing: not a copy of files, but a model that "understands" code and can answer questions about it.
+
+**Stale detection as prediction error.** In predictive coding, the brain notices when its predictions diverge from incoming signals. The post-commit hook compares file hashes against stored representations — a literal mismatch detector between the model's "beliefs" and reality.
+
+**Lazy retrain as Bayesian updating.** The brain doesn't recompute all beliefs when a single stimulus arrives. It updates only those that become relevant. Cognit does the same — the hook marks patterns as stale, but retraining happens only on the next `/ask`, when that knowledge is actually needed.
+
+**The pipeline as hierarchical inference.** Each agent (navigator → analyst → arch → style → coder → reviewer) is a layer that compresses and refines the representation top-down — much like layers of cortex, from sensory input to abstract reasoning and back.
+
+**Agents as specialized cortical regions.** Each agent has its own "world model" (KV-cache) trained on its domain. They don't know everything — they contribute their specific expertise to a shared inference process.
+
+Karl Friston would call this **active inference** — a system that minimizes the gap between its model and reality through two mechanisms: updating the model (retrain) or changing the world (patch). Cognit does both.
+
+This wasn't designed top-down from theory. It was built bottom-up from intuition about how persistent understanding should work. The fact that it converges with Bayesian brain theory suggests that context distillation may be more than an engineering trick — it may reflect something fundamental about how knowledge systems need to operate.
+
+---
+
 ## Where This Is Now
 
 A working prototype. The full cycle: task → navigation → agent pipeline → diff → application — works on real projects. One model (Qwen3-8B, ~5 GB VRAM), everything in-process, no external dependencies besides llama-cpp-python and tree-sitter.

@@ -18,12 +18,15 @@
 - [x] Move system prompt to cognit_i18n.py (bilingual)
 - [x] Move pipeline stage comments to cognit_i18n.py (STAGE_COMMENTS)
 - [x] cognit_setup.py: all prints → msg(), _AGENT_TEMPLATES → cognit_i18n.py
+- [x] Lightweight git hook: cognit_hook.py (no model loading, stale detection, BM25 update)
+- [x] Stale pattern management: mark_stale/clear_stale/is_stale in cognit_core.py
+- [x] LLM reranking: BM25 top-20 → LLM rerank → top-8 (retrieve-then-rerank)
+- [x] ARTICLE.md: added "Why This Architecture Looks Like the Brain" section (EN + RU)
 
 ## Backlog
 
 - [ ] Try Qwen2.5-Coder-7B-Instruct as replacement model
-- [ ] Test git hook after all changes
-- [ ] Neural ranking: Transformer ranks BM25 candidates (optional, after `route`)
+- [ ] Test git hook + LLM reranking end-to-end
 - [ ] Tree-sitter support for other languages (JS/TS, Go, Rust)
 - [ ] S3 pattern sync between machines
 - [ ] Web interface (read-only pattern dashboard)

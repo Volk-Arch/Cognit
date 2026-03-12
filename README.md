@@ -82,7 +82,7 @@ echo_patterns/my-project/
   feature-login/   ← conversation accumulates between sessions (grow)
 ```
 
-In feature branches, each question is appended to the KV-cache — the model remembers the entire conversation history. A post-commit hook automatically updates patterns for changed files.
+In feature branches, each question is appended to the KV-cache — the model remembers the entire conversation history. A **lightweight post-commit hook** (`cognit_hook.py`) detects changed files without loading the model — it marks affected patterns as stale and incrementally updates the BM25 index. Stale patterns are lazily retrained on next `/ask`.
 
 ---
 
@@ -94,18 +94,20 @@ When a user describes a task, Cognit needs to find the relevant files. For this 
 
 **Symbols** are extracted from the AST: function names, classes, methods, imports — along with line numbers, signatures, and docstrings. This creates a structural map of the project without needing to read all the code.
 
-### BM25 — Symbol Search
+### BM25 + LLM Reranking — Symbol Search
 
-A BM25 index is built from the extracted symbols — a classic text search algorithm (the same one used in Elasticsearch). The user's query is tokenized and ranked by symbol relevance.
+A BM25 index is built from the extracted symbols — a classic text search algorithm. The user's query is tokenized and ranked by symbol relevance.
+
+On top of BM25, an **LLM reranking** step semantically scores the top-20 candidates and selects the most relevant 8. This handles cases where BM25 misses — e.g., function `process_data` found by task "fix data processing".
 
 ```
 Query: "bayes update"
-Results:
-  • main.py: bayes_update() [lines 42-67]     ← BM25 score: 8.2
-  • main.py: validate_input() [lines 12-25]   ← BM25 score: 3.1
+  BM25 top-20 → LLM rerank → top-8:
+  • main.py: bayes_update() [lines 42-67]     ← most relevant
+  • main.py: validate_input() [lines 12-25]
 ```
 
-The index is **incremental** — on subsequent runs it skips files with unchanged hashes. The cache is stored in `_code_index.json`.
+The index is **incremental** — on subsequent runs it skips files with unchanged hashes. The cache is stored in `_code_index.json`. Reranking can be disabled via `"rerank": false` in `.echo.json`.
 
 ### ChatML — Model Communication Format
 
@@ -123,7 +125,7 @@ Critical detail: `llm.tokenize()` is called with `special=True` — without this
 
 ## 3. Limitations
 
-**No semantic search.** Code navigation works via BM25 — text matching of keywords against symbol names. If a function is called `process_data` but the task is described as "fix input data processing", BM25 may not find it. Tasks should specify concrete names or at least an approximate direction.
+**Limited semantic search.** Code navigation works via BM25 + LLM reranking. BM25 is lexical — it matches keywords against symbol names. LLM reranking adds semantic understanding but costs ~2-5s per search. If both miss, tasks should specify concrete function/class names.
 
 **Model context is limited to 8192 tokens** (~300-400 lines of code). The pipeline truncates files exceeding 8000 characters. For large files, the navigator focuses context on the relevant lines using line numbers from tree-sitter.
 
@@ -265,12 +267,14 @@ my-project/              ← client git repo
 
 Cognit/                  ← this repository
   cognit.py              ← entry point
-  cognit_transformer.py  ← Transformer backend (KV-cache, Qwen3)
-  cognit_index.py        ← tree-sitter navigator (AST + BM25)
+  cognit_transformer.py  ← Transformer backend (KV-cache, Qwen)
+  cognit_index.py        ← tree-sitter navigator (AST + BM25 + LLM rerank)
   cognit_pipeline.py     ← pipeline configuration
-  cognit_core.py         ← utilities (git, patterns, hashes)
+  cognit_core.py         ← utilities (git, patterns, hashes, stale detection)
+  cognit_hook.py         ← lightweight post-commit hook (no model loading)
   cognit_patch.py        ← unified diff application
   cognit_agents.py       ← agents/ handling
+  cognit_i18n.py         ← bilingual messages (EN/RU)
   cognit_setup.py        ← one-time setup
 ```
 
