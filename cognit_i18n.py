@@ -283,6 +283,8 @@ _MESSAGES = {
                                   "ru": "⚠️  Think-фаза слишком длинная — генерация остановлена"},
     "warn_garbage":             {"en": "\n⚠️  Garbage output — generation stopped",
                                   "ru": "\n⚠️  Мусорный вывод — генерация остановлена"},
+    "warn_script_drift":        {"en": "\n⚠️  Script drift detected — generation stopped",
+                                  "ru": "\n⚠️  Обнаружена смена языка/скрипта — генерация остановлена"},
 
     # ── Pipeline ─────────────────────────────────────────────────────────────
     "info_pipeline_stages":     {"en": "\n🚀 Pipeline  ({n} stages{suffix})",

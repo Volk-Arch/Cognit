@@ -510,6 +510,28 @@ class CodeIndex:
             lines.append("")
         return "\n".join(lines)
 
+    def results_summary(self, results: list[SearchResult]) -> str:
+        """Format pre-found results as a text report (no extra search)."""
+        if not results:
+            return "No relevant symbols found."
+        by_file: dict[str, list[SearchResult]] = {}
+        for r in results:
+            by_file.setdefault(r.filepath, []).append(r)
+        lines = [f"Found {len(results)} symbols in {len(by_file)} files:\n"]
+        for filepath, file_results in by_file.items():
+            rel = _relative_path(filepath, self.project_dir)
+            lines.append(f"### {rel}")
+            for r in file_results:
+                sym = r.symbol
+                if sym.kind in ("function", "class"):
+                    lines.append(f"  {sym.signature}  (lines {sym.line_start}-{sym.line_end})")
+                else:
+                    lines.append(f"  {sym.name}")
+                if sym.docstring:
+                    lines.append(f"         {sym.docstring[:100]}")
+            lines.append("")
+        return "\n".join(lines)
+
     # ─── Grep (raw text search) ─────────────────────────────────────────
     def grep_files(self, pattern: str, max_results: int = 50) -> list[GrepResult]:
         """Case-insensitive text search across all project files."""

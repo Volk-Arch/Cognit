@@ -50,6 +50,17 @@ STOP_TOKENS = ["<|im_end|>", "<|im_start|>"]
 # </think> is NOT included: it appears in recent_text right after answer_started → false stop
 ANSWER_STOP_PATTERNS = ["Human:", "User:", "\nHuman:", "\nUser:"]
 
+# Training data leakage patterns — model finished answer but continues with unrelated content
+DRIFT_PATTERNS = [
+    "**Created Question**", "**Created Answer**",
+    "Translate the given", "Translate the following",
+    "translate into", "翻译", "翻译成",
+    "Given a sentence", "Given the following",
+    "Write a program", "Write a function",
+    "###instruction", "### Instruction",
+    "Below is an instruction",
+]
+
 # =============================================================================
 # INITIALIZATION
 # =============================================================================
@@ -352,6 +363,21 @@ def ask_pattern(name: str, question: str, grow: bool = True) -> str:
                 break
         else:
             junk_streak = 0
+        # Script drift detector: CJK characters or training data leakage patterns
+        if answer_started and len(collected) > 30:
+            recent_30 = "".join(collected[-30:])
+            # CJK in non-CJK context
+            cjk_count = sum(1 for ch in recent_30 if '\u4e00' <= ch <= '\u9fff'
+                            or '\u3040' <= ch <= '\u30ff'
+                            or '\uac00' <= ch <= '\ud7af')
+            if cjk_count >= 5:
+                print(msg("warn_script_drift"))
+                break
+            # Common training data patterns
+            recent_100 = "".join(collected[-100:]) if len(collected) > 100 else full
+            if any(dp in recent_100 for dp in DRIFT_PATTERNS):
+                print(msg("warn_script_drift"))
+                break
 
     # Erase dots if think did not finish
     if think_dots and not answer_started:
@@ -396,6 +422,10 @@ def ask_pattern(name: str, question: str, grow: bool = True) -> str:
     for stop in STOP_TOKENS + ANSWER_STOP_PATTERNS:
         if stop in response:
             response = response[:response.index(stop)]
+    # Trim training data leakage from response
+    for dp in DRIFT_PATTERNS:
+        if dp in response:
+            response = response[:response.index(dp)]
     response = response.strip()
 
     return response
@@ -1125,7 +1155,7 @@ def _route_via_index(task: str) -> tuple[list[str], str]:
             seen.add(r.filepath)
             files.append(r.filepath)
 
-    context_note = idx.search_summary(task, top_k=10)
+    context_note = idx.results_summary(results)
 
     print(msg("info_symbols_found", n_symbols=len(results), n_files=len(files)))
     for f in files:
