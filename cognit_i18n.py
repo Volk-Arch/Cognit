@@ -177,6 +177,18 @@ EXAMPLE:
 # All UI messages — {key: {en: "...", ru: "..."}}
 # ---------------------------------------------------------------------------
 _MESSAGES = {
+    # ── System prompt (ChatML context) ──────────────────────────────────────
+    "system_prompt_context":    {"en": "You are an assistant with preloaded context. "
+                                       "Answer questions based on the loaded context. "
+                                       "If there is not enough information in the context, say so.",
+                                 "ru": "Ты — ассистент с предзагруженным контекстом. "
+                                       "Отвечай на вопросы, опираясь на загруженный контекст. "
+                                       "Если информации в контексте недостаточно, скажи об этом."},
+    "user_load_context":        {"en": "Load context:",
+                                 "ru": "Загрузи контекст:"},
+    "assistant_context_loaded": {"en": "Context loaded. Ready to answer questions.",
+                                 "ru": "Контекст загружен. Готов отвечать на вопросы."},
+
     # ── Init & model ─────────────────────────────────────────────────────────
     "err_llama_not_installed":   {"en": "❌ llama-cpp-python is not installed.",
                                   "ru": "❌ llama-cpp-python не установлен."},

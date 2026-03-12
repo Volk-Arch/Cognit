@@ -40,8 +40,8 @@ REPO_NAME    = core.git_repo_name()
 BRANCH_NAME  = core.git_branch()
 PATTERNS_DIR = core.make_patterns_dir(REPO_NAME, BRANCH_NAME)
 
-# Qwen3 stop tokens (ChatML)
-# </think> is NOT included in the main list: Qwen3 outputs <think></think> before the answer
+# ChatML stop tokens
+# </think> is NOT included: some models output <think></think> before the answer
 STOP_TOKENS = ["<|im_end|>", "<|im_start|>"]
 
 # Stop patterns for the answer: model starts playing other roles → stop
@@ -131,19 +131,16 @@ def _check_and_refresh(name: str):
 
 
 def _context_prompt(text: str) -> str:
-    """Build a prompt with context in ChatML format (Qwen3)."""
+    """Build a prompt with context in ChatML format."""
     return (
         "<|im_start|>system\n"
-        "Ты — ассистент с предзагруженным контекстом. "
-        "Отвечай на вопросы, опираясь на загруженный контекст. "
-        "Если информации в контексте недостаточно, скажи об этом. "
-        "/no_think\n"
+        + msg("system_prompt_context") + "\n"
         "<|im_end|>\n"
         "<|im_start|>user\n"
-        f"Загрузи контекст:\n\n{text.strip()}\n"
+        + msg("user_load_context") + f"\n\n{text.strip()}\n"
         "<|im_end|>\n"
         "<|im_start|>assistant\n"
-        "Контекст загружен. Готов отвечать на вопросы.\n"
+        + msg("assistant_context_loaded") + "\n"
         "<|im_end|>\n"
     )
 
@@ -509,23 +506,23 @@ def _run_pipeline(task: str, files: list[str], nav_memo: str = "") -> str:
             p.unlink()
 
     # ── Shared context: task + files (focused by memo) ───────────────────────
-    shared = f"## Задача\n{task}\n\n"
-    _log("Задача", task)
+    shared = f"## Task\n{task}\n\n"
+    _log("Task", task)
 
     for fpath in files:
         try:
             content = _focused_file_content(fpath, nav_memo)
             fname   = Path(fpath).name
-            shared += f"## Файл: {fname}\n```\n{content}\n```\n\n"
-            _log(f"Файл: {fname}", f"```\n{content}\n```")
+            shared += f"## File: {fname}\n```\n{content}\n```\n\n"
+            _log(f"File: {fname}", f"```\n{content}\n```")
         except Exception as e:
             print(f"   ⚠️  {fpath}: {e}")
 
     # ── Navigation (tree-sitter) — once at the beginning ─────────────────────
     nav_stage = next((s for s in stages if s.get("type") in ("navigator", "rwkv")), None)
     if nav_stage and nav_memo:
-        shared += f"## Навигация\n{nav_memo}\n\n"
-        _log("Навигация", nav_memo)
+        shared += f"## Navigation\n{nav_memo}\n\n"
+        _log("Navigation", nav_memo)
         print(f"\n[nav] navigator")
         print(msg("info_nav_memo", memo=nav_memo[:120]))
     elif nav_stage:
@@ -562,11 +559,11 @@ def _run_pipeline(task: str, files: list[str], nav_memo: str = "") -> str:
             # (KV-cache continuation breaks on large injections — save_pattern is reliable)
             tmp_name = f"_agent_{sid}"
             if agent_text:
-                combined = f"## Знания агента: {agent_name}\n{agent_text}\n\n---\n\n{shared}"
+                combined = f"## Agent knowledge: {agent_name}\n{agent_text}\n\n---\n\n{shared}"
             else:
                 combined = shared
             save_pattern(tmp_name, combined, grow_policy="retrain")
-            memo_result = ask_pattern(tmp_name, role + "\n/no_think", grow=False)
+            memo_result = ask_pattern(tmp_name, role, grow=False)
             memo = memo_result or ""
 
             # Remove temporary pattern
@@ -592,8 +589,8 @@ def _run_pipeline(task: str, files: list[str], nav_memo: str = "") -> str:
 
         save_pattern("_pipeline", shared, grow_policy="retrain")
         coder_q = (
-            f"Задача: {task}\n\n"
-            f"Файлы: {file_names}\n\n"
+            f"Task: {task}\n\n"
+            f"Files: {file_names}\n\n"
             f"{role}"
         )
         coder_response = ask_pattern("_pipeline", coder_q, grow=False)
@@ -623,19 +620,19 @@ def _run_pipeline(task: str, files: list[str], nav_memo: str = "") -> str:
                         tree_info += idx.file_summary(abs_target) + "\n\n"
 
         # Reviewer context: task + source files + diff + tree
-        review_ctx = f"## Задача\n{task}\n\n"
+        review_ctx = f"## Task\n{task}\n\n"
         for fpath in files:
             try:
                 content = Path(fpath).read_text(encoding="utf-8", errors="ignore")[:6000]
-                review_ctx += f"## Файл: {Path(fpath).name}\n```\n{content}\n```\n\n"
+                review_ctx += f"## File: {Path(fpath).name}\n```\n{content}\n```\n\n"
             except Exception:
                 pass
-        review_ctx += f"## Diff от кодера\n```diff\n{coder_response}\n```\n\n"
+        review_ctx += f"## Coder diff\n```diff\n{coder_response}\n```\n\n"
         if tree_info:
-            review_ctx += f"## Структура файлов (tree-sitter)\n{tree_info}\n"
+            review_ctx += f"## File structure (tree-sitter)\n{tree_info}\n"
 
         save_pattern("_pipeline", review_ctx, grow_policy="retrain")
-        reviewed = ask_pattern("_pipeline", role + "\n/no_think", grow=False)
+        reviewed = ask_pattern("_pipeline", role, grow=False)
 
         if reviewed and "```" in reviewed:
             coder_response = reviewed
@@ -754,20 +751,20 @@ def _do_edit(file_path: str, task: str, base_pattern: str | None = None) -> str:
     print(msg("status_reading_file", path=p.resolve(), lines=n_lines, chars=len(content)))
 
     file_block = (
-        f"# Файл для редактирования: {p.resolve()}\n\n"
+        f"# File to edit: {p.resolve()}\n\n"
         f"```\n{content}\n```"
     )
     edit_question = (
         f"{task}\n\n"
-        "Выдай unified diff для этого изменения. Используй точные номера строк из файла.\n"
-        "Формат:\n"
-        "--- a/имя_файла\n"
-        "+++ b/имя_файла\n"
+        "Output a unified diff for this change. Use exact line numbers from the file.\n"
+        "Format:\n"
+        "--- a/filename\n"
+        "+++ b/filename\n"
         "@@ -N,M +N,M @@\n"
-        " контекстная строка\n"
-        "-удалённая строка\n"
-        "+добавленная строка\n"
-        "Только diff, без объяснений."
+        " context line\n"
+        "-removed line\n"
+        "+added line\n"
+        "Only diff, no explanations."
     )
 
     if base_pattern and core.pattern_exists(PATTERNS_DIR, base_pattern):
@@ -793,7 +790,7 @@ def _load_path(name: str, raw_path: str, force_policy: str = None):
             print(msg("err_empty_folder", path=raw_path))
             return
         texts, paths = [], []
-        header = f"# Проект: {p.name}\nПуть: {p.resolve()}\nФайлов: {len(files)}\n"
+        header = f"# Project: {p.name}\nPath: {p.resolve()}\nFiles: {len(files)}\n"
         texts.append(header)
         for f in files:
             try:
@@ -1045,8 +1042,8 @@ def cli_loop() -> None:
                         print(msg("info_reformatting"))
                         base_source = _read_pattern_source(active)
                         last_response = _ephemeral_eval_ask(
-                            [base_source, f"Предыдущий ответ:\n\n{last_response}"],
-                            "Покажи изменения из этого ответа в виде unified diff (```diff блок).",
+                            [base_source, f"Previous response:\n\n{last_response}"],
+                            "Show the changes from this response as a unified diff (```diff block).",
                             "_patch_tmp",
                         )
                         diffs = _extract_all_diffs(last_response)
@@ -1130,9 +1127,9 @@ def cli_loop() -> None:
 
                 elif cmd in ("review", "style"):
                     default_q = (
-                        "Сделай код-ревью с учётом правил проекта. Что нужно исправить?"
+                        "Do a code review considering project rules. What needs to be fixed?"
                         if cmd == "review" else
-                        "Проверь соответствие нашим стандартам стиля. Перечисли нарушения."
+                        "Check compliance with our style standards. List violations."
                     )
                     # Syntax: /review [agent] @<file> [question]
                     # parts[1] — agent or @file; if not @, it's the agent name

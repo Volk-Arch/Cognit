@@ -107,7 +107,7 @@ def setup_config():
 
     t_model_path = _ask(
         msg("setup_ask_model_path"),
-        ex_t.get("model_path", "models/Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf")
+        ex_t.get("model_path", "models/Qwen/qwen2.5-coder-7b-instruct-q4_k_m.gguf")
     )
 
     lang = _ask("   Language / Язык (en/ru)", existing.get("lang", "en"))
