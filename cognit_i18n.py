@@ -524,3 +524,422 @@ _MESSAGES = {
     "setup_banner_main":        {"en": "\n╔══════════════════════════════════════════════╗\n║  🧠 Cognit — Project Setup                   ║\n╚══════════════════════════════════════════════╝",
                                   "ru": "\n╔══════════════════════════════════════════════╗\n║  🧠 Cognit — Настройка проекта             ║\n╚══════════════════════════════════════════════╝"},
 }
+
+
+# ---------------------------------------------------------------------------
+# Agent templates — example knowledge base for setup
+# ---------------------------------------------------------------------------
+_AGENT_TEMPLATES_EN = {
+    "style/global.md": """\
+# Code Style — DemoAI
+
+## Naming
+- All functions and variables: `snake_case`
+- Private helpers (not part of public API): `_underscore_prefix` — e.g. `_read_prob`
+- Probability parameters: full names, no abbreviations:
+  - `prior_h` (not `p`, not `prior`)
+  - `p_e_given_h` (not `peh`, not `likelihood`)
+  - `p_e_given_not_h` (not `pnh`)
+  - `posterior` (not `post`, not `result`)
+- Mathematical negation in names: `_not_h` suffix (not `_neg`, not `_complement`)
+- Step counters: `step` (not `i`, not `n`, not `iteration`)
+- Constants: `UPPER_SNAKE_CASE` if added at module level
+
+## Formatting
+- Indentation: 4 spaces (no tabs)
+- Max line length: 88 characters
+- Blank lines: 2 between top-level functions
+- Quotes: double for user-facing strings, single allowed inside f-strings
+- Float output: always `.6f` for probabilities — `f"{value:.6f}"`
+
+## Imports
+- First line: `from __future__ import annotations`
+- Order: stdlib -> (third-party if any) -> local
+- `import *` is forbidden
+
+## Type Hints
+- Type hints required for all functions (parameters + return value)
+- `float` for probabilities, `str` for prompts, `None` for procedures
+- Python 3.10+ syntax: `X | None` instead of `Optional[X]`
+
+## User Messages
+- Style: polite imperative — "Enter...", "Try...", "Probability must be..."
+- Validation error format: one sentence, specific correction
+- Result format: two numbers in a column, aligned by `:`:
+  ```
+    P(H) was:      0.300000
+    P(H|E) now:    0.462963
+  ```
+- Step header: `f"\\nStep {step}:"` — with blank line before
+
+## Error Handling
+- `ZeroDivisionError`: raise from `bayes_update` with a clear message
+- Catch explicitly: `except ZeroDivisionError as e:` — no bare `except:`
+- `KeyboardInterrupt`: catch in `main`, print `"\\nExit."` and terminate
+- `ValueError`: catch in `_read_prob` on `float()`, continue loop
+- Never show traceback to user
+
+## Anti-patterns (forbidden)
+- Abbreviating probability parameter names (`peh`, `pnh`, `ph`)
+- Formatting float without precision (only `.6f` or explicit other)
+- Adding global state (all data via function parameters)
+- Breaking the `prior -> bayes_update -> posterior -> new prior` chain with hidden assignments
+- Mixing computation and output: `bayes_update` must not print anything
+""",
+
+    "style/commands.md": """\
+# Interactive CLI Style — DemoAI
+
+## Input Prompts
+- Format: `"Enter {description}: "` — colon and space before cursor
+- Step prompts: indented `"  Enter P(E|H): "` (2 spaces)
+- Support comma as decimal separator (`.replace(",", ".")`)
+- Exit command: `q`, `quit`, `exit` — case-insensitive, at any input point
+
+## Output
+- Two numbers in a column, aligned by `:`:
+  ```
+    P(H) was:      0.300000
+    P(H|E) now:    0.462963
+  ```
+- Always `.6f` for probabilities — 6 decimal places
+- Blank line before each step: `print(f"\\nStep {step}:")`
+
+## Error Messages
+- One line, no emoji — educational project, no harsh tone
+- Examples: `"Enter a number (e.g. 0.2) or q to quit."`
+- `"Probability must be in range [0, 1]."`
+- `f"Error: {e}"` — for ZeroDivisionError
+
+## Exit
+- `"\\nExit."` — on `q` or Ctrl+C, with blank line before
+- No `sys.exit()` with non-zero code for normal user exit
+""",
+
+    "arch/overview.md": """\
+# Architecture — DemoAI
+
+## Project Structure
+```
+main.py   — all code, three functions
+README.md — description
+```
+No packages, no subdirectories, no dependencies beyond stdlib (`sys`).
+
+## Three Functions and Their Roles
+
+### `_read_prob(prompt: str) -> float`
+- The only user input point
+- Infinite loop until a valid float in [0, 1] is received
+- Handles: non-numeric input (ValueError), range, exit command (KeyboardInterrupt)
+- Knows nothing about Bayesian logic — only probability number validation
+- To add a new input type — create a similar `_read_*` helper
+
+### `bayes_update(prior_h, p_e_given_h, p_e_given_not_h) -> float`
+- Pure function: computation only, no I/O
+- Implements: `P(H|E) = P(E|H)*P(H) / [P(E|H)*P(H) + P(E|~H)*(1-P(H))]`
+- Only failure mode: `ZeroDivisionError` when denominator == 0.0
+- Always called with three floats, returns one float
+- New Bayesian formula — add next to this function, same style
+
+### `main() -> None`
+- Entry point and entire UI loop
+- Catches exceptions from `bayes_update` and `KeyboardInterrupt`
+- Manages state: `prior` (float) and `step` (int)
+- Iterative pattern: `prior = posterior` at end of each step
+
+## Data Flow
+```
+_read_prob("P(H)")  ->  prior
+  |
+loop:
+  _read_prob("P(E|H)")    ->  p_e_h
+  _read_prob("P(E|~H)")   ->  p_e_nh
+  bayes_update(prior, p_e_h, p_e_nh)  ->  posterior
+  prior = posterior
+  step += 1
+```
+
+## Extension Rules
+
+**Where to add new computations:** next to `bayes_update`, as a separate pure function.
+Example: `log_odds_update(prior_h, likelihood_ratio) -> float`.
+
+**Where to add new input types:** new `_read_*` helper, call from `main`.
+Example: `_read_label(prompt: str) -> str` for named hypotheses.
+
+**Where to add output:** only in `main`. `bayes_update` must not print anything.
+
+**Where NOT to add global state:** everything passed via parameters.
+
+## Critical Invariants
+- `bayes_update` remains a pure function — no print, no input, no side effects
+- Denominator in `bayes_update` is checked before division — `ZeroDivisionError` if 0.0
+- `prior` after each step = previous `posterior` — the chain must not break
+- All probabilities in [0, 1] — `_read_prob` guarantees this at input
+""",
+
+    "context/project.md": """\
+# Project Context — DemoAI
+
+## What It Is
+An educational interactive Bayesian probability update calculator.
+The user enters a prior probability P(H) and at each step — new evidence
+P(E|H) and P(E|~H). The program shows how belief updates iteratively via Bayes' theorem.
+
+## Goal
+Demonstrate Bayesian thinking: how accumulating evidence changes hypothesis probability.
+Not a production tool — an educational demo for probability theory students.
+
+## Audience
+Students and beginner developers studying probabilistic inference.
+
+## Technologies
+- Python 3.10+ (`X | None` syntax, `from __future__ import annotations`)
+- Standard library only (`sys`) — no external dependencies
+- No DB, filesystem, HTTP — fully stateless
+
+## Principles
+- **Simplicity first** — one task, one file, three functions
+- **No dependencies** — if you need a library, it's probably overkill
+- **Pure functions** — computation separated from I/O
+- **Clear errors** — user always knows what to enter to continue
+
+## What Is Appropriate to Add
+- Named hypotheses: `"Enter hypothesis name: "` -> `"H: it's raining"`
+- Step history: list of `(prior, p_e_h, p_e_nh, posterior)` with summary at the end
+- Alternative Bayesian update forms (log-odds, likelihood ratio)
+- CSV export of step history via `csv.writer`
+- Batch processing mode via command-line arguments (`argparse`)
+
+## What Is NOT Appropriate to Add
+- Web interface, HTTP server, REST API
+- Database, sessions, users
+- External libraries (numpy, scipy) — overkill for educational demo
+- Multithreading / async
+- GUI (tkinter, PyQt) — project is CLI-oriented
+
+## Bayes' Formula (reference)
+```
+P(H|E) = P(E|H) * P(H)
+         ─────────────────────────────────────
+         P(E|H) * P(H) + P(E|~H) * (1 - P(H))
+```
+Where:
+- P(H) — prior probability of hypothesis (before observing evidence)
+- P(E|H) — probability of evidence given hypothesis is true (likelihood)
+- P(E|~H) — probability of evidence given hypothesis is false
+- P(H|E) — posterior probability (after observation, becomes new prior)
+""",
+}
+
+_AGENT_TEMPLATES_RU = {
+    "style/global.md": """\
+# Стиль кода — DemoAI
+
+## Именование
+- Все функции и переменные: `snake_case`
+- Приватные хелперы (не часть публичного API): `_underscore_prefix` — например `_read_prob`
+- Параметры вероятностей: полные имена, не сокращать:
+  - `prior_h` (не `p`, не `prior`)
+  - `p_e_given_h` (не `peh`, не `likelihood`)
+  - `p_e_given_not_h` (не `pnh`)
+  - `posterior` (не `post`, не `result`)
+- Математическое отрицание в именах: суффикс `_not_h` (не `_neg`, не `_complement`)
+- Счётчики шагов: `step` (не `i`, не `n`, не `iteration`)
+- Константы: `UPPER_SNAKE_CASE` если добавляются на уровне модуля
+
+## Форматирование
+- Отступы: 4 пробела (без табов)
+- Максимальная длина строки: 88 символов
+- Пустые строки: 2 между топ-уровневыми функциями
+- Кавычки: двойные для строк пользователю, одинарные допустимы внутри f-строк
+- Float-вывод: всегда `.6f` для вероятностей — `f"{value:.6f}"`
+
+## Импорты
+- Первая строка файла: `from __future__ import annotations`
+- Порядок: stdlib → (сторонние, если появятся) → локальные
+- `import *` запрещён
+
+## Типизация
+- Тип-хинты обязательны для всех функций (параметры + возвращаемое значение)
+- `float` для вероятностей, `str` для промптов, `None` для процедур
+- Python 3.10+ синтаксис: `X | None` вместо `Optional[X]`
+
+## Сообщения пользователю
+- Язык: русский (проект русскоязычный)
+- Стиль: вежливый императив — «Введите...», «Попробуйте...», «Вероятность должна быть...»
+- Формат ошибки валидации: одно предложение, конкретное исправление
+- Формат результата: два числа в столбик с выравниванием:
+  ```
+    P(H) было:     0.300000
+    P(H|E) стало:  0.462963
+  ```
+- Заголовок шага: `f"\\nШаг {step}:"` — с пустой строкой перед
+
+## Обработка ошибок
+- `ZeroDivisionError`: поднимать из `bayes_update` с понятным русским сообщением
+- Ловить явно: `except ZeroDivisionError as e:` — не голый `except:`
+- `KeyboardInterrupt`: ловить в `main`, печатать `"\\nВыход."` и завершать
+- `ValueError`: ловить в `_read_prob` при `float()`, продолжать цикл
+- Не выводить traceback пользователю
+
+## Антипаттерны (запрещено)
+- Сокращать имена параметров вероятностей (`peh`, `pnh`, `ph`)
+- Форматировать float без указания точности (только `.6f` или явная другая)
+- Добавлять глобальное состояние (все данные через параметры функций)
+- Разрывать цепочку `prior → bayes_update → posterior → новый prior` скрытыми присваиваниями
+- Смешивать вычисление и вывод: `bayes_update` не должна печатать ничего
+""",
+
+    "style/commands.md": """\
+# Стиль интерактивного CLI — DemoAI
+
+## Промпты ввода
+- Формат: `"Введите {описание}: "` — двоеточие и пробел перед курсором
+- Шаговые промпты: с отступом `"  Введите P(E|H): "` (2 пробела)
+- Поддержка запятой как десятичного разделителя (`.replace(",", ".")`)
+- Команда выхода: `q`, `quit`, `exit` — регистронезависимо, в любой точке ввода
+
+## Вывод результатов
+- Два числа в столбик, выравнивание по `:`:
+  ```
+    P(H) было:     0.300000
+    P(H|E) стало:  0.462963
+  ```
+- Всегда `.6f` для вероятностей — 6 знаков после запятой
+- Пустая строка перед каждым шагом: `print(f"\\nШаг {step}:")`
+
+## Сообщения об ошибках
+- Одна строка, без `❌` — проект учебный, строгий тон не нужен
+- Примеры: `"Введите число (например 0.2) или q для выхода."`
+- `"Вероятность должна быть в диапазоне [0, 1]."`
+- `f"Ошибка: {e}"` — для ZeroDivisionError
+
+## Завершение
+- `"\\nВыход."` — по `q` или Ctrl+C, с пустой строкой перед
+- Нет `sys.exit()` с ненулевым кодом для нормального выхода пользователя
+""",
+
+    "arch/overview.md": """\
+# Архитектура DemoAI
+
+## Структура проекта
+```
+main.py   — весь код, три функции
+README.md — описание
+```
+Нет пакетов, нет подпапок, нет зависимостей кроме stdlib (`sys`).
+
+## Три функции и их роли
+
+### `_read_prob(prompt: str) -> float`
+- Единственная точка ввода от пользователя
+- Бесконечный цикл до получения корректного float в [0, 1]
+- Обрабатывает: нечисловой ввод (ValueError), диапазон, команду выхода (KeyboardInterrupt)
+- Не знает о байесовской логике — только валидация числа-вероятности
+- Если нужно добавить новый тип ввода — создавать аналогичный хелпер `_read_*`
+
+### `bayes_update(prior_h, p_e_given_h, p_e_given_not_h) -> float`
+- Чистая функция: только вычисление, никакого I/O
+- Реализует формулу: `P(H|E) = P(E|H)*P(H) / [P(E|H)*P(H) + P(E|¬H)*(1-P(H))]`
+- Единственный способ упасть: `ZeroDivisionError` когда знаменатель == 0.0
+- Всегда вызывается с тремя float, возвращает один float
+- Если добавляется новая байесовская формула — рядом с этой функцией, тем же стилем
+
+### `main() -> None`
+- Точка входа и весь UI-цикл
+- Ловит исключения от `bayes_update` и `KeyboardInterrupt`
+- Управляет состоянием: `prior` (float) и `step` (int)
+- Итеративный паттерн: `prior = posterior` в конце каждого шага
+
+## Поток данных
+```
+_read_prob("P(H)")  →  prior
+  ↓
+loop:
+  _read_prob("P(E|H)")    →  p_e_h
+  _read_prob("P(E|¬H)")   →  p_e_nh
+  bayes_update(prior, p_e_h, p_e_nh)  →  posterior
+  prior = posterior
+  step += 1
+```
+
+## Правила расширения
+
+**Куда добавлять новые вычисления:** рядом с `bayes_update`, как отдельная чистая функция.
+Пример: `log_odds_update(prior_h, likelihood_ratio) -> float`.
+
+**Куда добавлять новые типы ввода:** новый хелпер `_read_*`, вызывать из `main`.
+Пример: `_read_label(prompt: str) -> str` для именованных гипотез.
+
+**Куда добавлять вывод:** только в `main`. `bayes_update` не должна ничего печатать.
+
+**Куда НЕ добавлять глобальное состояние:** всё передаётся через параметры.
+
+## Критические инварианты
+- `bayes_update` остаётся чистой функцией — без print, без input, без side effects
+- Знаменатель в `bayes_update` проверяется перед делением — `ZeroDivisionError` если 0.0
+- `prior` после каждого шага = предыдущий `posterior` — цепочка не должна прерываться
+- Все вероятности в [0, 1] — `_read_prob` гарантирует это на входе
+""",
+
+    "context/project.md": """\
+# Контекст проекта — DemoAI
+
+## Что это
+Учебный интерактивный калькулятор байесовского обновления вероятностей.
+Пользователь вводит априорную вероятность P(H) и на каждом шаге — новые свидетельства
+P(E|H) и P(E|¬H). Программа показывает как вера обновляется итерационно по формуле Байеса.
+
+## Цель
+Демонстрация байесовского мышления: как накопление свидетельств меняет вероятность гипотезы.
+Не production-инструмент — образовательное демо для студентов теории вероятностей.
+
+## Аудитория
+Студенты и начинающие разработчики изучающие вероятностный вывод.
+Русскоязычный интерфейс — все сообщения на русском.
+
+## Технологии
+- Python 3.10+ (используется синтаксис `X | None`, `from __future__ import annotations`)
+- Только стандартная библиотека (`sys`) — никаких внешних зависимостей
+- Никакой БД, файловой системы, HTTP — полностью stateless
+
+## Принципы
+- **Простота прежде всего** — одна задача, один файл, три функции
+- **Никаких зависимостей** — если нужна библиотека, скорее всего это перебор
+- **Чистые функции** — вычисление отделено от ввода/вывода
+- **Понятные ошибки** — пользователь всегда знает что ввести чтобы продолжить
+
+## Что уместно добавлять
+- Именованные гипотезы: `"Введите название гипотезы: "` → `"H: дождь идёт"`
+- История шагов: список `(prior, p_e_h, p_e_nh, posterior)` с выводом в конце
+- Альтернативные формы байесовского обновления (log-odds, likelihood ratio)
+- CSV-экспорт истории шагов через `csv.writer`
+- Режим пакетной обработки через аргументы командной строки (`argparse`)
+
+## Что НЕ уместно добавлять
+- Веб-интерфейс, HTTP-сервер, REST API
+- База данных, сессии, пользователи
+- Внешние библиотеки (numpy, scipy) — для учебного демо избыточно
+- Многопоточность / асинхронность
+- GUI (tkinter, PyQt) — проект CLI-ориентированный
+
+## Байесовская формула (для справки)
+```
+P(H|E) = P(E|H) × P(H)
+         ─────────────────────────────────────
+         P(E|H) × P(H) + P(E|¬H) × (1 − P(H))
+```
+Где:
+- P(H) — априорная вероятность гипотезы (до наблюдения свидетельства)
+- P(E|H) — вероятность свидетельства если гипотеза верна (likelihood)
+- P(E|¬H) — вероятность свидетельства если гипотеза неверна
+- P(H|E) — апостериорная вероятность (после наблюдения, становится новым prior)
+""",
+}
+
+
+def agent_templates() -> dict:
+    """Return agent templates for the current language."""
+    return _AGENT_TEMPLATES_RU if LANG == "ru" else _AGENT_TEMPLATES_EN

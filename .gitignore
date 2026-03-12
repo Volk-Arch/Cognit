@@ -24,3 +24,5 @@ CLAUDE.md
 .claude/
 .idea/
 .venv/
+
+# Cognit — patterns are not versioned, stored locally or in S3
