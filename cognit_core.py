@@ -139,10 +139,11 @@ def print_patterns_list(patterns_dir: str):
             m = json.load(f)
         backend = m.get("backend", "?")[0].upper()   # T / R
         policy  = "~" if m.get("grow_policy") == "grow" else ""
+        stale   = "!" if m.get("stale") else ""
         saved   = m.get("saved_at", "")[:10]          # 2026-03-09
         asks    = m.get("n_asks", 0)
         asks_s  = f"  {asks}q" if asks else ""
-        print(f"  • {m['name']}{policy}  [{backend}]  {saved}{asks_s}")
+        print(f"  • {m['name']}{stale}{policy}  [{backend}]  {saved}{asks_s}")
 
 
 def hint_patterns(patterns_dir: str):
@@ -174,6 +175,43 @@ def check_stale_sources(patterns_dir: str, name: str) -> list[str]:
         elif file_hash(path) != src["hash"]:
             changed.append(path)
     return changed
+
+
+def mark_stale(patterns_dir: str, name: str, changed_paths: list[str]) -> bool:
+    """Mark pattern as stale. Merges changed_paths into stale_files. Returns True if state changed."""
+    meta = read_meta(patterns_dir, name)
+    if not meta:
+        return False
+    existing = set(meta.get("stale_files", []))
+    merged = existing | set(changed_paths)
+    if meta.get("stale") and merged == existing:
+        return False
+    meta["stale"] = True
+    meta["stale_files"] = sorted(merged)
+    write_meta(patterns_dir, name, meta)
+    return True
+
+
+def clear_stale(patterns_dir: str, name: str):
+    """Remove stale flag from pattern metadata (after retrain)."""
+    meta = read_meta(patterns_dir, name)
+    if not meta:
+        return
+    changed = False
+    if "stale" in meta:
+        del meta["stale"]
+        changed = True
+    if "stale_files" in meta:
+        del meta["stale_files"]
+        changed = True
+    if changed:
+        write_meta(patterns_dir, name, meta)
+
+
+def is_stale(patterns_dir: str, name: str) -> bool:
+    """Quick check for stale flag."""
+    meta = read_meta(patterns_dir, name)
+    return bool(meta and meta.get("stale"))
 
 
 # =============================================================================

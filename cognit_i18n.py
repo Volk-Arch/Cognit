@@ -91,6 +91,49 @@ def agent_role(name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Pipeline stage comments (human-readable, written to pipeline.json)
+# ---------------------------------------------------------------------------
+STAGE_COMMENTS = {
+    "navigator": {
+        "en": "Memo from tree-sitter navigator: which files, where to look",
+        "ru": "Памятка от tree-sitter навигатора: какие файлы, где искать",
+    },
+    "analyst": {
+        "en": "Analyst: reviews code + task -> concrete change plan",
+        "ru": "Аналитик: смотрит код + задачу → конкретный план изменений",
+    },
+    "context": {
+        "en": "Agent: project context, business requirements",
+        "ru": "Агент: контекст проекта, бизнес-требования",
+    },
+    "arch": {
+        "en": "Agent: architecture, dependencies, patterns",
+        "ru": "Агент: архитектура, зависимости, паттерны",
+    },
+    "style": {
+        "en": "Agent: style, formatting, naming",
+        "ru": "Агент: стиль, форматирование, нейминг",
+    },
+    "coder": {
+        "en": "Final stage: coder writes diff using full context",
+        "ru": "Финальный этап: кодер пишет diff используя весь контекст",
+    },
+    "reviewer": {
+        "en": "Review: checks diff against tree-sitter structure, removes duplicates",
+        "ru": "Ревью: проверяет diff по tree-sitter структуре, убирает дубли",
+    },
+}
+
+
+def stage_comment(stage_id: str) -> str:
+    """Return localized pipeline stage comment."""
+    entry = STAGE_COMMENTS.get(stage_id)
+    if entry is None:
+        return ""
+    return entry.get(LANG, entry.get("en", ""))
+
+
+# ---------------------------------------------------------------------------
 # HELP text
 # ---------------------------------------------------------------------------
 HELP = {
@@ -431,6 +474,20 @@ _MESSAGES = {
                                   "ru": "Неизвестный флаг: {flag}"},
     "info_available_flags":     {"en": "Flags: --refresh-file <path>, --status",
                                   "ru": "Флаги: --refresh-file <path>, --status"},
+    "warn_refresh_deprecated":  {"en": "⚠️  --refresh-file is deprecated. Run 'python cognit_setup.py' to update your hook.",
+                                  "ru": "⚠️  --refresh-file устарел. Запустите 'python cognit_setup.py' для обновления хука."},
+
+    # ── cognit_hook.py ────────────────────────────────────────────────────────
+    "hook_checking":            {"en": "[Cognit] Checking {count} changed file(s)...",
+                                  "ru": "[Cognit] Проверяю {count} изменённых файл(ов)..."},
+    "hook_marked_stale":        {"en": "[Cognit] Marked {count} pattern(s) as stale.",
+                                  "ru": "[Cognit] Отмечено устаревших паттернов: {count}."},
+    "hook_index_updated":       {"en": "[Cognit] Index updated.",
+                                  "ru": "[Cognit] Индекс обновлён."},
+    "hook_all_current":         {"en": "[Cognit] All patterns current.",
+                                  "ru": "[Cognit] Все паттерны актуальны."},
+    "hook_no_patterns_dir":     {"en": "[Cognit] No patterns directory, skipping.",
+                                  "ru": "[Cognit] Каталог паттернов не найден, пропускаю."},
 
     # ── cognit_core.py ───────────────────────────────────────────────────────
     "info_patterns_list_empty": {"en": "   No patterns — load: /load <name> @<file>",

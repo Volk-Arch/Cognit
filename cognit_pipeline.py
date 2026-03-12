@@ -37,7 +37,7 @@ Example pipeline.json:
 import json
 from pathlib import Path
 
-from cognit_i18n import msg, agent_role
+from cognit_i18n import msg, agent_role, stage_comment
 
 PIPELINE_FILENAME = "pipeline.json"
 
@@ -45,52 +45,13 @@ PIPELINE_FILENAME = "pipeline.json"
 DEFAULT_PIPELINE: dict = {
     "passes": 1,    # 1 = single run; 2 = double run of agents
     "stages": [
-        {
-            "id":      "navigator",
-            "type":    "navigator",
-            "enabled": True,
-            "comment": "Memo from tree-sitter navigator: which files, where to look"
-        },
-        {
-            "id":      "analyst",
-            "type":    "agent",
-            "name":    "analyst",
-            "enabled": True,
-            "comment": "Analyst: reviews code + task -> concrete change plan"
-        },
-        {
-            "id":      "context",
-            "type":    "agent",
-            "name":    "context",
-            "enabled": True,
-            "comment": "Agent: project context, business requirements"
-        },
-        {
-            "id":      "arch",
-            "type":    "agent",
-            "name":    "arch",
-            "enabled": True,
-            "comment": "Agent: architecture, dependencies, patterns"
-        },
-        {
-            "id":      "style",
-            "type":    "agent",
-            "name":    "style",
-            "enabled": True,
-            "comment": "Agent: style, formatting, naming"
-        },
-        {
-            "id":      "coder",
-            "type":    "coder",
-            "enabled": True,
-            "comment": "Final stage: coder writes diff using full context"
-        },
-        {
-            "id":      "reviewer",
-            "type":    "reviewer",
-            "enabled": True,
-            "comment": "Review: checks diff against tree-sitter structure, removes duplicates"
-        }
+        {"id": "navigator", "type": "navigator",                    "enabled": True},
+        {"id": "analyst",   "type": "agent", "name": "analyst",     "enabled": True},
+        {"id": "context",   "type": "agent", "name": "context",     "enabled": True},
+        {"id": "arch",      "type": "agent", "name": "arch",        "enabled": True},
+        {"id": "style",     "type": "agent", "name": "style",       "enabled": True},
+        {"id": "coder",     "type": "coder",                        "enabled": True},
+        {"id": "reviewer",  "type": "reviewer",                     "enabled": True},
     ]
 }
 
@@ -139,13 +100,21 @@ def _with_roles(pipeline: dict) -> dict:
 
 
 def save_default_pipeline(client_project: str) -> Path | None:
-    """Writes pipeline.json to the client project if it doesn't exist."""
+    """Writes pipeline.json to the client project if it doesn't exist.
+    Comments are localized based on current language setting."""
     if not client_project:
         return None
     p = Path(client_project) / PIPELINE_FILENAME
     if p.exists():
         return p  # do not overwrite existing
-    p.write_text(json.dumps(DEFAULT_PIPELINE, ensure_ascii=False, indent=2),
+    import copy
+    out = copy.deepcopy(DEFAULT_PIPELINE)
+    for stage in out.get("stages", []):
+        sid = stage.get("name", stage.get("id", ""))
+        comment = stage_comment(sid)
+        if comment:
+            stage["comment"] = comment
+    p.write_text(json.dumps(out, ensure_ascii=False, indent=2),
                  encoding="utf-8")
     print(msg("ok_pipeline_created", path=p))
     return p

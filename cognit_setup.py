@@ -169,38 +169,20 @@ def setup_gitignore():
 # =============================================================================
 # STEP 3: post-commit hook
 # =============================================================================
-def _make_hook_script(echo_script_path: str) -> str:
-    """Generate hook script with absolute path to the echo script."""
+def _make_hook_script(cognit_dir: str) -> str:
+    """Generate lightweight hook script. No model loading — just marks stale + updates index."""
     # Use forward slashes — Git sh on Windows understands them
-    posix_path = Path(echo_script_path).as_posix()
+    posix_dir = Path(cognit_dir).as_posix()
     return f"""\
 #!/bin/sh
-# Cognit — post-commit hook
-# echo script: {posix_path}
+# Cognit — post-commit hook (lightweight, no model loading)
+# cognit dir: {posix_dir}
 
-if git rev-parse HEAD~1 >/dev/null 2>&1; then
-    CHANGED=$(git diff HEAD~1 HEAD --name-only)
-else
-    CHANGED=$(git show --name-only --pretty="" HEAD)
-fi
-
-if [ -z "$CHANGED" ]; then
-    exit 0
-fi
-
-ECHO_SCRIPT="{posix_path}"
-if [ ! -f "$ECHO_SCRIPT" ]; then
-    exit 0
-fi
-
-echo "[Cognit] Checking patterns for changed files..."
-echo "$CHANGED" | while read -r file; do
-    python "$ECHO_SCRIPT" --refresh-file "$file" 2>/dev/null
-done
+cd "{posix_dir}" && python cognit_hook.py 2>/dev/null
 """
 
 
-def setup_hook(target_git_root: Path, echo_script_path: Path):
+def setup_hook(target_git_root: Path, cognit_dir: Path):
     """Install post-commit hook into the specified git repository."""
     hook_path = target_git_root / ".git" / "hooks" / "post-commit"
 
@@ -214,7 +196,7 @@ def setup_hook(target_git_root: Path, echo_script_path: Path):
             return
 
     hook_path.parent.mkdir(parents=True, exist_ok=True)
-    hook_path.write_text(_make_hook_script(str(echo_script_path)), encoding="utf-8")
+    hook_path.write_text(_make_hook_script(str(cognit_dir)), encoding="utf-8")
 
     try:
         import stat
@@ -357,15 +339,14 @@ def main():
     config = setup_config()
     setup_gitignore()
 
-    # Absolute path to the script (for the hook)
-    echo_dir = Path(__file__).parent.resolve()
-    transformer_script = echo_dir / "cognit_transformer.py"
+    # Absolute path to Cognit directory (for the hook)
+    cognit_dir = Path(__file__).parent.resolve()
 
     # Hook in the main (client) project
     client_root = _ask_client_project()
     if client_root:
         if _ask_yn(msg("setup_ask_hook_client", name=client_root.name), default=True):
-            setup_hook(client_root, transformer_script)
+            setup_hook(client_root, cognit_dir)
         # Save client project path to .echo.json
         config["client_project"] = str(client_root)
         with open(ECHO_CONFIG, "w", encoding="utf-8") as f:
@@ -374,7 +355,7 @@ def main():
 
     # Hook in Cognit repo itself (optional)
     if git_root and _ask_yn(msg("setup_ask_hook_cognit"), default=False):
-        setup_hook(git_root, transformer_script)
+        setup_hook(git_root, cognit_dir)
 
     if _ask_yn(msg("setup_ask_agents"), default=True):
         setup_agents(client_root)  # None if no client → creates in CWD

@@ -101,12 +101,20 @@ def unload_model():
 # =============================================================================
 def _check_and_refresh(name: str):
     """Check pattern freshness. If files changed — offer to recreate."""
-    changed = core.check_stale_sources(PATTERNS_DIR, name)
-    if not changed:
+    meta = core.read_meta(PATTERNS_DIR, name)
+    if not meta:
+        return
+
+    # Combine pre-computed stale_files (from hook) with live check
+    stale_files = set(meta.get("stale_files", []))
+    live_changed = core.check_stale_sources(PATTERNS_DIR, name)
+    all_changed = sorted(stale_files | set(live_changed))
+
+    if not all_changed:
         return
 
     print(msg("warn_files_changed", name=name))
-    for c in changed:
+    for c in all_changed:
         print(f"    • {c}")
 
     try:
@@ -118,7 +126,6 @@ def _check_and_refresh(name: str):
         print(msg("info_continue_old"))
         return
 
-    meta = core.read_meta(PATTERNS_DIR, name)
     texts, paths = [], []
     for src in meta.get("source_files", []):
         p = src["path"]
@@ -128,6 +135,7 @@ def _check_and_refresh(name: str):
 
     if texts:
         save_pattern(name, "\n\n".join(texts), source_files=paths)
+        core.clear_stale(PATTERNS_DIR, name)
 
 
 def _context_prompt(text: str) -> str:
@@ -1376,6 +1384,7 @@ def headless_status():
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         if sys.argv[1] == "--refresh-file" and len(sys.argv) > 2:
+            print(msg("warn_refresh_deprecated"))
             init_model()
             headless_refresh_file(sys.argv[2])
         elif sys.argv[1] == "--status":
