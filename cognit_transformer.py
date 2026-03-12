@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2026 Igor Kriusov <kriusovia@gmail.com>
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-"""cognit_transformer.py — Transformer backend (Qwen3). KV-cache → .pkl."""
+"""cognit_transformer.py — Transformer backend (Qwen2.5-Coder). KV-cache → .pkl."""
 
 import os
 import re
@@ -18,17 +18,18 @@ from cognit_patch import (_extract_diff, _extract_all_diffs, _diff_target,
 from cognit_agents import echo_config as _echo_config, list_agents as _list_agents, read_agent_text as _read_agent_text
 from cognit_i18n import msg, set_lang, HELP as HELP_TEXTS
 try:
-    from cognit_index import CodeIndex
+    from cognit_index import CodeIndex, SearchResult as _SearchResult
     _HAS_INDEX = True
 except ImportError:
     CodeIndex = None
+    _SearchResult = None
     _HAS_INDEX = False
 
 # =============================================================================
 # CONFIGURATION — read from .echo.json (key "transformer"), defaults below
 # =============================================================================
 _c           = _echo_config().get("transformer", {})
-MODEL_PATH   = _c.get("model_path",   "models/Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf")
+MODEL_PATH   = _c.get("model_path",   "models/Qwen/qwen2.5-coder-7b-instruct-q4_k_m.gguf")
 MODEL_NAME   = Path(MODEL_PATH).stem
 N_CTX        = _c.get("n_ctx",        8192)
 N_GPU_LAYERS = _c.get("n_gpu_layers", -1)
@@ -267,7 +268,7 @@ def ask_pattern(name: str, question: str, grow: bool = True) -> str:
     print("─" * 50)
 
     # reset=False — do not reset loaded KV-cache!
-    # Qwen3 outputs <think>...</think> before the answer — hide this block
+    # Some models output <think>...</think> before the answer — hide this block
     collected = []
     answer_started = False
     think_dots = 0  # dot indicator counter during think phase
@@ -738,6 +739,31 @@ def _ephemeral_eval_ask(texts: list[str], question: str,
     return result or ""
 
 
+def _llm_expand_query(task: str) -> list[str]:
+    """
+    Ask the LLM to suggest likely function/class names for an abstract task.
+    Returns extra search terms to combine with the original query.
+    """
+    prompt = (
+        f"Task: {task}\n\n"
+        "What Python function or class names might be related to this task?\n"
+        "List 5-10 likely names (snake_case for functions, CamelCase for classes).\n"
+        "Return ONLY the names, one per line. No explanations."
+    )
+    print(msg("info_expanding_query"))
+    response = _ephemeral_eval_ask([prompt], "List likely symbol names:",
+                                   tmp_name="_expand_tmp")
+    if not response:
+        return []
+    terms = []
+    for line in response.strip().splitlines():
+        name = line.strip().lstrip("•-0123456789.) ").strip()
+        # Keep only valid identifiers
+        if name and re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', name):
+            terms.append(name)
+    return terms[:10]
+
+
 def _llm_rerank(task: str, candidates_text: str, top_k: int = 8) -> list[int]:
     """
     Ask the LLM to rerank search candidates by relevance to the task.
@@ -936,36 +962,144 @@ def _get_code_index(rebuild: bool = False):
     return idx
 
 
+_STOP_WORDS = {
+    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "shall",
+    "should", "may", "might", "must", "can", "could", "to", "of", "in",
+    "for", "on", "with", "at", "by", "from", "as", "into", "about",
+    "it", "its", "this", "that", "and", "or", "but", "not", "no",
+    "fix", "add", "make", "get", "set", "use", "all", "how", "what",
+    "исправь", "добавь", "сделай", "как", "что", "все", "это", "для",
+    "нужно", "надо", "можно",
+}
+
+
+def _extract_grep_terms(task: str) -> list[str]:
+    """Extract meaningful terms from task for grep search."""
+    tokens = re.split(r'[^a-zA-Z0-9а-яА-ЯёЁ_]+', task.lower())
+    return [t for t in tokens if len(t) >= 4 and t not in _STOP_WORDS][:5]
+
+
+def _merge_unique(target: list, source: list) -> int:
+    """Append items from source to target if (filepath, symbol.name) not already present."""
+    seen = {(r.filepath, r.symbol.name) for r in target}
+    added = 0
+    for r in source:
+        key = (r.filepath, r.symbol.name)
+        if key not in seen:
+            seen.add(key)
+            target.append(r)
+            added += 1
+    return added
+
+
+def _llm_chunked_scan(task: str, idx) -> list:
+    """Last-resort: scan all project files via LLM to find relevant code."""
+    print(msg("info_full_scan"))
+    all_files = sorted(idx.symbols.keys())
+    results = []
+    for filepath in all_files:
+        try:
+            content = Path(filepath).read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        if len(content) > 6000:
+            content = content[:6000]
+        fname = Path(filepath).name
+        print(msg("info_scan_checking", name=fname))
+        prompt = f"Task: {task}\n\nFile: {fname}\n```\n{content}\n```"
+        response = _ephemeral_eval_ask(
+            [prompt],
+            "Does this file contain code relevant to the task? "
+            "If yes, list the function/class names. If no, say NO.",
+            tmp_name="_scan_tmp"
+        )
+        if not response or "NO" in response.strip().upper()[:10]:
+            continue
+        # Match response to indexed symbols
+        resp_lower = response.lower()
+        matched = False
+        for sym in idx.symbols.get(filepath, []):
+            if sym.kind in ("function", "class") and sym.name.lower() in resp_lower:
+                results.append(_SearchResult(filepath, sym, 0.5, f"scan:{sym.name}"))
+                matched = True
+        if not matched:
+            # File is relevant but no specific symbol matched — add first function/class
+            for sym in idx.symbols.get(filepath, []):
+                if sym.kind in ("function", "class"):
+                    results.append(_SearchResult(filepath, sym, 0.3, "scan:file"))
+                    break
+        if len(results) >= 10:
+            break
+    if results:
+        print(msg("info_scan_found", count=len(results)))
+    else:
+        print(msg("info_scan_nothing"))
+    return results
+
+
 def _route_via_index(task: str) -> tuple[list[str], str]:
     """
-    Find relevant files for a task via tree-sitter index.
+    Cascading search: find relevant files for a task.
 
-    1. CodeIndex.search(task) → candidates (files + symbols)
-    2. Build a context note (which symbols were found)
-    3. Return (files, context_note)
-
-    No model switching — everything in-process.
+    Escalation from cheap to expensive:
+    [1] BM25 over symbols        — free, <100ms
+    [2] LLM query expansion      — ~2-3s, if [1] < 5
+    [3] grep over codebase       — free, <500ms
+    [4] find_dependencies (AST)  — free, <200ms
+    [5] LLM rerank               — ~2-3s
+    [6] chunked full scan        — ~30-120s, last resort
     """
     idx = _get_code_index()
     if idx is None:
         print(msg("warn_client_project"))
         return [], ""
 
-    # Phase 1: BM25 wide net
-    results = idx.search(task, top_k=20)
-    if not results:
-        print(msg("warn_no_symbols"))
-        return [], ""
-
-    # Phase 2: LLM rerank (if model loaded and enabled)
     cfg = _echo_config()
     rerank_enabled = cfg.get("transformer", {}).get("rerank", True)
-    if llm is not None and rerank_enabled and len(results) > 3:
+    llm_ok = llm is not None and rerank_enabled
+
+    # ── [1] BM25 ────────────────────────────────────────────────────
+    results = idx.search(task, top_k=20)
+
+    # ── [2] LLM expansion (if < 5) ─────────────────────────────────
+    if llm_ok and len(results) < 5:
+        extra_terms = _llm_expand_query(task)
+        if extra_terms:
+            expanded = idx.search(task + " " + " ".join(extra_terms), top_k=20)
+            added = _merge_unique(results, expanded)
+            print(msg("info_expand_done", count=len(extra_terms), total=len(results)))
+
+    # ── [3] grep (if still < 5) ────────────────────────────────────
+    if len(results) < 5:
+        grep_terms = _extract_grep_terms(task)
+        if grep_terms:
+            print(msg("info_grep_searching"))
+            all_grep: list = []
+            for term in grep_terms:
+                all_grep.extend(idx.grep_files(term, max_results=30))
+            if all_grep:
+                grep_as_sr = idx.grep_to_search_results(all_grep)
+                added = _merge_unique(results, grep_as_sr)
+                unique_files = len({g.filepath for g in all_grep})
+                print(msg("info_grep_found", count=len(all_grep), files=unique_files))
+
+    # ── [4] find dependencies (enrich found results) ───────────────
+    if results:
+        print(msg("info_deps_searching"))
+        found_names = [r.symbol.name for r in results[:8]]
+        found_files = list({r.filepath for r in results[:8]})
+        deps = idx.find_dependencies(found_names, found_files)
+        added = _merge_unique(results, deps)
+        if added:
+            print(msg("info_deps_found", count=added))
+
+    # ── [5] LLM rerank (if > 3 candidates) ────────────────────────
+    if llm_ok and len(results) > 3:
         candidates_text = idx.format_candidates(results)
         reranked = _llm_rerank(task, candidates_text, top_k=8)
         if reranked:
             reordered = [results[i - 1] for i in reranked if 1 <= i <= len(results)]
-            # Append any remaining results not selected by LLM
             selected = set(reranked)
             for i, r in enumerate(results, 1):
                 if i not in selected:
@@ -975,7 +1109,15 @@ def _route_via_index(task: str) -> tuple[list[str], str]:
         else:
             print(msg("info_rerank_fallback"))
 
-    # Unique files (by score/rerank order)
+    # ── [6] chunked full scan (last resort) ────────────────────────
+    if not results and llm_ok:
+        results = _llm_chunked_scan(task, idx)
+
+    if not results:
+        print(msg("warn_no_symbols"))
+        return [], ""
+
+    # ── Output ─────────────────────────────────────────────────────
     seen: set[str] = set()
     files: list[str] = []
     for r in results:
@@ -983,10 +1125,8 @@ def _route_via_index(task: str) -> tuple[list[str], str]:
             seen.add(r.filepath)
             files.append(r.filepath)
 
-    # Context note for pipeline
     context_note = idx.search_summary(task, top_k=10)
 
-    # Show what was found
     print(msg("info_symbols_found", n_symbols=len(results), n_files=len(files)))
     for f in files:
         rel = f.replace(idx.project_dir, "").lstrip("/\\")

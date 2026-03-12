@@ -12,7 +12,7 @@ When you open a new chat with an AI assistant, it knows nothing about you. You e
 
 There's an exact analogy for this problem. Imagine a colleague who comes in every morning with a completely wiped memory. A brilliant specialist who picks things up instantly — but doesn't remember yesterday's conversation. Every day you spend the first hour bringing them up to speed all over again.
 
-Cloud models (GPT-4, Claude) solve this with brute force — 128K token context, just paste everything in. But if you work with a **local** model on your own GPU — context is limited. Qwen3-8B sees ~8000 tokens at a time. That's 300-400 lines of code. One file — and there's no room left for the response.
+Cloud models (GPT-4, Claude) solve this with brute force — 128K token context, just paste everything in. But if you work with a **local** model on your own GPU — context is limited. Qwen2.5-Coder-7B can only see ~8000 tokens at a time. That's 300-400 lines of code. One file — and there's no room left for the response.
 
 ---
 
@@ -125,7 +125,7 @@ Patterns are tied to the git branch. Switch branches — and the patterns for th
 
 **Python only.** The tree-sitter navigator parses `.py` files. Other languages require adding the corresponding grammars.
 
-**One model for everything.** Navigation, agents, coder, reviewer — all on a single Qwen3-8B. Diff quality is limited by the capabilities of an 8B model.
+**One model for everything.** Navigation, agents, coder, reviewer — all on a single Qwen2.5-Coder-7B. Diff quality is limited by the capabilities of an 8B model.
 
 **Patterns are not portable.** The KV-cache is tied to a specific model and quantization. A different machine with a different version won't load someone else's patterns.
 
@@ -177,7 +177,7 @@ This wasn't designed top-down from theory. It was built bottom-up from intuition
 
 ## Where This Is Now
 
-A working prototype. The full cycle: task → navigation → agent pipeline → diff → application — works on real projects. One model (Qwen3-8B, ~5 GB VRAM), everything in-process, no external dependencies besides llama-cpp-python and tree-sitter.
+A working prototype. The full cycle: task → navigation → agent pipeline → diff → application — works on real projects. One model (Qwen2.5-Coder-7B, ~5 GB VRAM), everything in-process, no external dependencies besides llama-cpp-python and tree-sitter.
 
 The tools to build this are already available — local models on consumer hardware support everything needed. The approach can be adapted to other models and languages.
 
@@ -185,4 +185,4 @@ Code is open-source — [github.com/Volk-Arch/Cognit](https://github.com/Volk-Ar
 
 ---
 
-*Built with Python using Qwen3-8B (transformer, GGUF quantization), tree-sitter for code navigation, and BM25 for symbol search. All operations run locally.*
+*Built with Python using Qwen2.5-Coder-7B (transformer, GGUF quantization), tree-sitter for code navigation, and BM25 for symbol search. All operations run locally.*

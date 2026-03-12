@@ -2,7 +2,50 @@
 
 [🇷🇺 Русская версия](README.ru.md)
 
-A local AI assistant for codebases. One model (Qwen3-8B), everything in-process, no API keys required.
+A local AI assistant for codebases. One model (Qwen2.5-Coder-7B), everything in-process, no API keys required.
+
+```mermaid
+flowchart TD
+    task([user task]) --> S1
+
+    subgraph Search["Cascading Search"]
+        S1["① BM25 symbols"] --> S2["② LLM expand"]
+        S2 --> S3["③ grep codebase"]
+        S3 --> S4["④ find dependencies"]
+        S4 --> S5["⑤ LLM rerank"]
+        S5 --> S6["⑥ full scan"]
+    end
+
+    S6 --> P1
+
+    subgraph Pipeline["Agent Pipeline"]
+        P1[navigator] --> P2[analyst]
+        P2 --> P3[context / arch / style]
+        P3 --> P4[coder]
+        P4 --> P5[reviewer]
+    end
+
+    P5 -->|unified diff| patch([/patch])
+
+    commit([commit]) --> Hook
+
+    subgraph Hook["Post-Commit Hook (no model)"]
+        H1[git diff] --> H2[mark stale + update BM25]
+    end
+
+    Hook -.->|stale flag| Cache
+
+    subgraph Cache["KV-Cache per branch"]
+        C1["save_pattern"] <-->|"stale → retrain"| C2["ask_pattern"]
+    end
+
+    subgraph Branches["Branch Policies"]
+        B1["main — retrain on commit"]
+        B2["feature/* — grow conversation"]
+    end
+
+    Cache --- Branches
+```
 
 ---
 
@@ -10,7 +53,7 @@ A local AI assistant for codebases. One model (Qwen3-8B), everything in-process,
 
 ### 1.1. Pipeline with Context Distillation
 
-The main problem with small models is limited context. Qwen3-8B can only see ~8000 tokens at a time. If you feed it a file + all style conventions + architecture + the task — the context overflows and there's no room left for a response.
+The main problem with small models is limited context. Qwen2.5-Coder-7B can only see ~8000 tokens at a time. If you feed it a file + all style conventions + architecture + the task — the context overflows and there's no room left for a response.
 
 Cognit solves this with a **sequential pipeline**: each agent in a separate eval pass receives the file + its own knowledge and compresses it into a short memo (2-4 sentences). The coder at the end receives the file + focused memos instead of all the original documents:
 
@@ -94,24 +137,33 @@ When a user describes a task, Cognit needs to find the relevant files. For this 
 
 **Symbols** are extracted from the AST: function names, classes, methods, imports — along with line numbers, signatures, and docstrings. This creates a structural map of the project without needing to read all the code.
 
-### BM25 + LLM Reranking — Symbol Search
+### Cascading Search — From BM25 to Full Scan
 
-A BM25 index is built from the extracted symbols — a classic text search algorithm. The user's query is tokenized and ranked by symbol relevance.
+Finding the right files is a cascading process — each step only fires if the previous ones didn't find enough:
 
-On top of BM25, an **LLM reranking** step semantically scores the top-20 candidates and selects the most relevant 8. This handles cases where BM25 misses — e.g., function `process_data` found by task "fix data processing".
+| Step | Cost | When |
+|---|---|---|
+| **[1] BM25** over symbols | free, <100ms | always |
+| **[2] LLM query expansion** | ~2-3s | BM25 found < 5 results |
+| **[3] grep** over codebase | free, <500ms | still < 5 results |
+| **[4] find dependencies** (AST) | free, <200ms | enrich found results |
+| **[5] LLM rerank** | ~2-3s | > 3 candidates |
+| **[6] chunked full scan** | ~30-120s | nothing found (last resort) |
 
 ```
-Query: "bayes update"
-  BM25 top-20 → LLM rerank → top-8:
-  • main.py: bayes_update() [lines 42-67]     ← most relevant
-  • main.py: validate_input() [lines 12-25]
+Query: "fix data processing"
+  [1] BM25           → 0 results (no lexical match)
+  [2] LLM expansion  → suggests "process_data, DataHandler, parse_input"
+      BM25(expanded)  → 8 results
+  [4] dependencies   → +3 callers of process_data()
+  [5] LLM rerank     → top-8 by relevance
 ```
 
-The index is **incremental** — on subsequent runs it skips files with unchanged hashes. The cache is stored in `_code_index.json`. Reranking can be disabled via `"rerank": false` in `.echo.json`.
+The index is **incremental** — on subsequent runs it skips files with unchanged hashes. The cache is stored in `_code_index.json`. LLM-based steps can be disabled via `"rerank": false` in `.echo.json`.
 
 ### ChatML — Model Communication Format
 
-Qwen3 uses the ChatML format for role separation. llama-cpp-python does not apply the template automatically, so Cognit wraps each request manually:
+Qwen2.5-Coder uses the ChatML format for role separation. llama-cpp-python does not apply the template automatically, so Cognit wraps each request manually:
 
 ```
 <|im_start|>user
@@ -125,7 +177,7 @@ Critical detail: `llm.tokenize()` is called with `special=True` — without this
 
 ## 3. Limitations
 
-**Limited semantic search.** Code navigation works via BM25 + LLM reranking. BM25 is lexical — it matches keywords against symbol names. LLM reranking adds semantic understanding but costs ~2-5s per search. If both miss, tasks should specify concrete function/class names.
+**Search is heuristic, not perfect.** The cascading search (BM25 → LLM expansion → grep → dependencies → rerank → full scan) covers most cases, but very abstract queries with no lexical overlap may still require specifying concrete function/class names.
 
 **Model context is limited to 8192 tokens** (~300-400 lines of code). The pipeline truncates files exceeding 8000 characters. For large files, the navigator focuses context on the relevant lines using line numbers from tree-sitter.
 
@@ -135,7 +187,7 @@ Critical detail: `llm.tokenize()` is called with `special=True` — without this
 
 **Patterns are not portable.** KV-cache is tied to a specific model and llama-cpp-python version. A different machine with a different quantization cannot load another machine's patterns.
 
-**One model for everything.** Navigation, agents, coder, reviewer — everything runs on a single Qwen3-8B. This is convenient (one process, ~5 GB VRAM), but diff quality is limited by the capabilities of an 8B model.
+**One model for everything.** Navigation, agents, coder, reviewer — everything runs on a single model. This is convenient (one process, ~5 GB VRAM), but diff quality is limited by the capabilities of a 7-8B model.
 
 ---
 
@@ -147,7 +199,7 @@ pip install tree-sitter tree-sitter-python
 ```
 
 Download the model (GGUF) and place it in `models/`:
-- **Transformer**: `Qwen3-8B-Q4_K_M.gguf` (~4.7 GB VRAM)
+- **Transformer**: `qwen2.5-coder-7b-instruct-q4_k_m.gguf` (~4.7 GB VRAM)
 
 One-time setup:
 
@@ -163,7 +215,7 @@ Creates `.echo.json`, `agents/` templates, `pipeline.json`, and installs git hoo
 {
   "backend": "transformer",
   "transformer": {
-    "model_path":   "models/Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf",
+    "model_path":   "models/Qwen/qwen2.5-coder-7b-instruct-q4_k_m.gguf",
     "n_gpu_layers": -1,
     "n_ctx":        8192,
     "max_tokens":   512
@@ -268,7 +320,7 @@ my-project/              ← client git repo
 Cognit/                  ← this repository
   cognit.py              ← entry point
   cognit_transformer.py  ← Transformer backend (KV-cache, Qwen)
-  cognit_index.py        ← tree-sitter navigator (AST + BM25 + LLM rerank)
+  cognit_index.py        ← tree-sitter navigator (AST + BM25 + grep + deps)
   cognit_pipeline.py     ← pipeline configuration
   cognit_core.py         ← utilities (git, patterns, hashes, stale detection)
   cognit_hook.py         ← lightweight post-commit hook (no model loading)

@@ -124,6 +124,7 @@ def setup_config():
             "n_gpu_layers": ex_t.get("n_gpu_layers", -1),
             "n_ctx":        ex_t.get("n_ctx", 8192),
             "max_tokens":   ex_t.get("max_tokens", 512),
+            "rerank":       ex_t.get("rerank", True),
         },
         "_note": (
             "All team members must use the same model. "

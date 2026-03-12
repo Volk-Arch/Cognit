@@ -55,6 +55,14 @@ class SearchResult:
     context: str = ""      # brief description for output
 
 
+@dataclass
+class GrepResult:
+    """Raw text search result."""
+    filepath: str
+    line_no: int
+    line: str
+
+
 # =============================================================================
 # AST PARSER (tree-sitter)
 # =============================================================================
@@ -501,6 +509,99 @@ class CodeIndex:
                     lines.append(f"         {sym.docstring[:100]}")
             lines.append("")
         return "\n".join(lines)
+
+    # ─── Grep (raw text search) ─────────────────────────────────────────
+    def grep_files(self, pattern: str, max_results: int = 50) -> list[GrepResult]:
+        """Case-insensitive text search across all project files."""
+        results: list[GrepResult] = []
+        pat = pattern.lower()
+        for fpath in core.collect_text_files(self.project_dir):
+            try:
+                text = fpath.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            for i, line in enumerate(text.splitlines(), 1):
+                if pat in line.lower():
+                    results.append(GrepResult(str(fpath), i, line.strip()))
+                    if len(results) >= max_results:
+                        return results
+        return results
+
+    def grep_to_search_results(self, grep_results: list[GrepResult]) -> list[SearchResult]:
+        """Convert grep hits to SearchResult by finding the enclosing symbol."""
+        out: list[SearchResult] = []
+        seen: set[tuple[str, str]] = set()
+        for gr in grep_results:
+            syms = self.symbols.get(gr.filepath, [])
+            # Find enclosing symbol (line_start <= grep line <= line_end)
+            enclosing = None
+            for sym in syms:
+                if sym.line_start <= gr.line_no <= sym.line_end:
+                    enclosing = sym
+                    break
+            if enclosing is None:
+                # No enclosing symbol — use nearest function/class in the file
+                for sym in syms:
+                    if sym.kind in ("function", "class"):
+                        enclosing = sym
+                        break
+            if enclosing is None:
+                continue
+            key = (gr.filepath, enclosing.name)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(SearchResult(gr.filepath, enclosing, 0.1,
+                                    f"grep:{gr.line_no}"))
+        return out
+
+    # ─── Dependency tracking ─────────────────────────────────────────────
+    def find_dependencies(self, symbol_names: list[str],
+                          filepaths: list[str]) -> list[SearchResult]:
+        """
+        Find symbols that depend on the given symbols/files.
+        Checks imports and call-site references.
+        """
+        results: list[SearchResult] = []
+        seen: set[tuple[str, str]] = set()
+        target_files = {Path(f).stem for f in filepaths}
+        names_lower = {n.lower() for n in symbol_names}
+
+        for filepath, syms in self.symbols.items():
+            if filepath in filepaths:
+                continue  # skip files we already have
+
+            # Check imports referencing target files
+            has_import = False
+            for sym in syms:
+                if sym.kind == "import":
+                    import_text = sym.name.lower()
+                    if any(tf in import_text for tf in target_files):
+                        has_import = True
+                        break
+
+            if not has_import:
+                continue
+
+            # Check if any function/class body references our symbols
+            try:
+                content = Path(filepath).read_text(encoding="utf-8", errors="ignore").lower()
+            except Exception:
+                continue
+
+            for sym in syms:
+                if sym.kind not in ("function", "class"):
+                    continue
+                key = (filepath, sym.name)
+                if key in seen:
+                    continue
+                # Check if symbol names appear in the file near this symbol
+                # Simple: check if any target name appears in the file content
+                if any(name in content for name in names_lower):
+                    seen.add(key)
+                    results.append(SearchResult(filepath, sym, 0.2,
+                                                f"dep:{sym.name}"))
+        return results
 
     # ─── Cache ─────────────────────────────────────────────────────────
     def _cache_path(self) -> Path | None:

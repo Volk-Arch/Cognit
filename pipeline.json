@@ -1,0 +1,51 @@
+{
+  "passes": 1,
+  "stages": [
+    {
+      "id": "navigator",
+      "type": "navigator",
+      "enabled": true,
+      "comment": "Памятка от tree-sitter навигатора: какие файлы, где искать"
+    },
+    {
+      "id": "analyst",
+      "type": "agent",
+      "name": "analyst",
+      "enabled": true,
+      "comment": "Аналитик: смотрит код + задачу → конкретный план изменений"
+    },
+    {
+      "id": "context",
+      "type": "agent",
+      "name": "context",
+      "enabled": true,
+      "comment": "Агент: контекст проекта, бизнес-требования"
+    },
+    {
+      "id": "arch",
+      "type": "agent",
+      "name": "arch",
+      "enabled": true,
+      "comment": "Агент: архитектура, зависимости, паттерны"
+    },
+    {
+      "id": "style",
+      "type": "agent",
+      "name": "style",
+      "enabled": true,
+      "comment": "Агент: стиль, форматирование, нейминг"
+    },
+    {
+      "id": "coder",
+      "type": "coder",
+      "enabled": true,
+      "comment": "Финальный этап: кодер пишет diff используя весь контекст"
+    },
+    {
+      "id": "reviewer",
+      "type": "reviewer",
+      "enabled": true,
+      "comment": "Ревью: проверяет diff по tree-sitter структуре, убирает дубли"
+    }
+  ]
+}
